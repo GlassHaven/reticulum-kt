@@ -1,5 +1,6 @@
 package network.reticulum.interfaces.local
 
+import network.reticulum.transport.Transport
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
@@ -249,7 +250,7 @@ class LocalInterfaceTest {
     /**
      * Stress regression for the spawned-child read loop. On Android, real-world
      * Carina-as-shared-instance soak (>30 min uptime) has been observed to wedge
-     * a long-lived spawned child's read loop — inbound bytes stop draining even
+     * a long-lived spawned child's read loop - inbound bytes stop draining even
      * though the socket remains ESTABLISHED and outbound bytes still flow. The
      * suspected interaction was a redundant `withContext(Dispatchers.IO)` inside
      * the read loop (already running on `ioScope`'s IO dispatcher), which this
@@ -257,7 +258,7 @@ class LocalInterfaceTest {
      * pattern at `RNS/Interfaces/LocalInterface.py:302`.
      *
      * The wedge is not deterministically reproducible on a desktop JVM, so this
-     * test does not assert "wedge is fixed" — it asserts "long-lived spawned
+     * test does not assert "wedge is fixed" - it asserts "long-lived spawned
      * child keeps draining inbound bytes under aggressive sibling probe churn",
      * which is the regression guard for any future change that disturbs the
      * read loop body.
@@ -322,6 +323,54 @@ class LocalInterfaceTest {
             receivedCount.get(),
             "Long-lived client sent $numRounds packets, server received ${receivedCount.get()}. " +
                 "Read loop may have wedged under sibling churn.",
+        )
+    }
+
+    /**
+     * Regression: transient probe-style connections (open + immediate close,
+     * the shape that `Reticulum.isSharedInstanceRunning(port)` produces on
+     * every shared-instance auto-recovery poll) should not leave stale entries
+     * in `Transport.localClientInterfaces`. Python's `LocalInterface.teardown()`
+     * at `RNS/Interfaces/LocalInterface.py:353-354` removes the spawned interface
+     * from `Transport.local_client_interfaces` via `in` + `remove` - identity
+     * equality on the same `spawned_interface` object that was appended at
+     * `LocalInterface.py:462`. The kotlin port relies on the same identity
+     * invariant via the `InterfaceAdapter.getOrCreate` cache; this test fails
+     * loudly if that invariant ever breaks (e.g. via the read-loop / register
+     * ordering race fixed in this commit).
+     */
+    @Test
+    fun `transient probe connections do not leak Transport localClientInterfaces entries`() {
+        val tcpPort = 37434
+        val numProbes = 10
+        val baseline = Transport.localClientCount()
+
+        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        server!!.start()
+
+        repeat(numProbes) {
+            Socket().use { probe ->
+                probe.connect(InetSocketAddress("127.0.0.1", tcpPort), 1000)
+                // Immediately close - mimics a watchdog probe.
+            }
+            Thread.sleep(20)
+        }
+
+        // Poll until the server has reaped all transient spawned children.
+        val deadline = System.currentTimeMillis() + 3000
+        while (System.currentTimeMillis() < deadline && server!!.clientCount() > 0) {
+            Thread.sleep(50)
+        }
+
+        assertEquals(
+            0,
+            server!!.clientCount(),
+            "Server still reports live spawned children after probes closed; LocalClientInterface.readLoop / detach path did not run",
+        )
+        assertEquals(
+            baseline,
+            Transport.localClientCount(),
+            "Transport.localClientInterfaces accumulated stale entries after $numProbes transient probe connects (expected baseline=$baseline)",
         )
     }
 
