@@ -601,6 +601,22 @@ object Transport {
         interfaceDiscoverySources.clear()
         blackholeLastChecked = 0
 
+        // Every other table is cleared here; this one was not, so a stopped
+        // Reticulum left its detached interfaces registered. The next start
+        // registered fresh ones alongside the dead ones, and because the path
+        // table is reloaded from storage naming the OLD interface hash,
+        // findInterfaceByHash matched a detached interface and the first
+        // packet of the new session was transmitted onto it:
+        //   [Sideband] processOutgoing called but interface not online
+        //              (online=false, detached=true)
+        //   [Transport] Transmit error on Sideband: Interface is not online
+        // A link request is not retried, so the session then waited out the
+        // full establishment timeout having sent nothing. Only reachable once
+        // something actually stops Reticulum within the process lifetime,
+        // which Haven began doing when it released the stack on the last
+        // disconnect (#588).
+        interfaces.clear()
+
         // Stop discovery
         interfaceAnnouncer?.stop()
         interfaceAnnouncer = null
