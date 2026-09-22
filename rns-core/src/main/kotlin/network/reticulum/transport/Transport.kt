@@ -3298,21 +3298,18 @@ object Transport {
                 when {
                     pathEntry.hops > 1 && isHeader1 && !isLink -> {
                         val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
-                        transmit(outboundInterface, transportRaw)
-                        sent = true
+                        if (transmit(outboundInterface, transportRaw)) sent = true
                     }
                     pathEntry.hops == 1 && isConnectedToSharedInstance && isHeader1 && !isLink -> {
                         // Python Transport.py:993-1011: a 1-hop destination behind a shared
                         // instance still needs transport wrapping so the instance forwards.
                         val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
-                        transmit(outboundInterface, transportRaw)
-                        sent = true
+                        if (transmit(outboundInterface, transportRaw)) sent = true
                     }
                     pathEntry.hops <= 1 || isLink -> {
                         // Direct transmission (hops==0 for self/local-client, hops==1 direct,
                         // or any Link destination — see isLink comment above).
-                        transmit(outboundInterface, packedData)
-                        sent = true
+                        if (transmit(outboundInterface, packedData)) sent = true
                     }
                     // pathEntry.hops > 1 but packet is already HEADER_2: fall through to
                     // broadcast below, matching Python's "sent stays False" behavior.
@@ -3345,8 +3342,7 @@ object Transport {
             if (targetInterface != null) {
                 log("Sending to $destHex on attached interface ${targetInterface.name} (${packedData.size} bytes)")
                 if (targetInterface.canSend && targetInterface.online) {
-                    transmit(targetInterface, packedData)
-                    sent = true
+                    if (transmit(targetInterface, packedData)) sent = true
                 } else {
                     log("Attached interface ${targetInterface.name} is not available")
                 }
@@ -3384,8 +3380,7 @@ object Transport {
                         if (!AnnounceFilter.shouldForward(iface.mode, isLocal, null)) continue
                     }
 
-                    transmit(iface, packedData)
-                    sent = true
+                    if (transmit(iface, packedData)) sent = true
                 }
             }
         }
@@ -3426,10 +3421,18 @@ object Transport {
      * during the released window — same posture as if the inbound packet that
      * mutated it had arrived a few microseconds later.
      */
+    /**
+     * Transmit raw data on an interface.
+     * Applies IFAC masking if the interface has IFAC enabled.
+     *
+     * @return true only when [InterfaceRef.send] completed without throwing.
+     * Callers that record a packet as sent must use this result: a throwing
+     * send (e.g. a detached interface still marked online) must not count.
+     */
     private fun transmit(
         interfaceRef: InterfaceRef,
         data: ByteArray,
-    ) {
+    ): Boolean {
         try {
             val transmitData =
                 if (interfaceRef.ifacIdentity != null && interfaceRef.ifacSize > 0) {
@@ -3461,8 +3464,10 @@ object Transport {
 
             trafficTxBytes += transmitData.size
             recordTxBytes(interfaceRef, transmitData.size)
+            return true
         } catch (e: Exception) {
             log("Transmit error on ${interfaceRef.name}: ${e.message}")
+            return false
         }
     }
 
