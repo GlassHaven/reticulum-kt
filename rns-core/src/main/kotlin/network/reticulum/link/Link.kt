@@ -439,6 +439,15 @@ class Link private constructor(
     var teardownReason: Int = LinkConstants.TEARDOWN_REASON_UNKNOWN
         private set
 
+    /**
+     * Why establishment cannot succeed, when that is known before the timeout
+     * fires — currently a link request no interface would carry (#591). Null
+     * while nothing has gone visibly wrong. A caller that times out can read
+     * this to tell "nobody answered" from "it was never sent".
+     */
+    var establishmentError: String? = null
+        private set
+
     // Timing
     var rtt: Long? = null
         private set
@@ -623,10 +632,24 @@ class Link private constructor(
         requestTime = System.currentTimeMillis()
 
         startWatchdog()
-        Transport.outbound(packet)
+        val sent = Transport.outbound(packet)
         hadOutbound()
 
-        log("Link request ${linkId.toHexString()} sent to ${destination.hexHash}")
+        // Deliberately NOT torn down here (#591 suggested it and it is wrong).
+        // Callbacks are wired before initializeAsInitiator runs, so a teardown
+        // on this line fires linkClosed re-entrantly, inside Link.create, before
+        // the caller holds the returned Link — InitiatorSession assigns `link`
+        // only after create() returns and then waits on its own latch, so it
+        // would still block for the full timeout AND have been told the link
+        // closed before it thought it had opened. Reporting the failure is what
+        // the caller was missing; the timeout path already works.
+        val failure = linkRequestSendFailure(sent, linkId.toHexString(), destination.hexHash)
+        if (failure != null) {
+            establishmentError = failure
+            log(failure)
+        } else {
+            log("Link request ${linkId.toHexString()} sent to ${destination.hexHash}")
+        }
     }
 
     /**
