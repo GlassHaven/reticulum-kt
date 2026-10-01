@@ -625,6 +625,7 @@ private fun allocateFreePort(): Int {
 private fun resetWireState() {
     val stale = wireInstances.values.toList()
     wireInstances.clear()
+    wireReplayRawCache.clear()
     wireRequestHandlerLog.clear()
     wireKeepalivePayloads.clear()
     runCatching { Transport.outboundTapForTest = null }
@@ -3192,9 +3193,13 @@ private fun handleWireCmd3(command: String, p: JsonObject): JsonObject? = when (
         if (corruption == "pristine_link_inbound" || corruption == "replay_reflag") {
             val cacheKey = "$handle|$linkIdHex"
             val cached = wireReplayRawCache[cacheKey]
-            val reused = cached != null
+            // `reused_raw` reports whether THIS call injected the captured
+            // frame. Only replay_reflag consumes the cached frame; a repeated
+            // pristine_link_inbound always builds and injects a fresh one, so
+            // it must not be flagged as a reuse.
+            val reused = corruption == "replay_reflag" && cached != null
             val inj = when {
-                corruption == "replay_reflag" && reused -> cached!!.copyOf()
+                reused -> cached!!.copyOf()
                 else -> raw.copyOf()
             }
             if (corruption == "replay_reflag") {
