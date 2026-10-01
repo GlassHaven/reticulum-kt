@@ -601,6 +601,8 @@ object Transport {
         interfaceDiscoverySources.clear()
         blackholeLastChecked = 0
 
+        interfaces.clear()
+
         // Stop discovery
         interfaceAnnouncer?.stop()
         interfaceAnnouncer = null
