@@ -40,6 +40,9 @@ class ReticulumSharedInstanceStartupOrderTest {
         /** Mirrors Interface.onPacketReceived; the registrar wires it. */
         var onPacketReceived: ((ByteArray, FakeClientInterface) -> Unit)? = null
 
+        /** When true, start() throws to model a failed connect (port dropped). */
+        val startThrows = AtomicBoolean(false)
+
         /** Set when the registrar had already run by the time start() fired. */
         val registrarAppliedAtStart = AtomicBoolean(false)
 
@@ -48,6 +51,9 @@ class ReticulumSharedInstanceStartupOrderTest {
 
         /** Models the read loop: a frame arriving the instant start() runs. */
         fun start() {
+            if (startThrows.get()) {
+                throw RuntimeException("simulated shared-instance connect failure")
+            }
             registrarAppliedAtStart.set(registrarApplied.get())
             if (onPacketReceived == null) {
                 droppedFrameCount.incrementAndGet()
@@ -106,5 +112,36 @@ class ReticulumSharedInstanceStartupOrderTest {
         // instant the read loop goes live is not dropped (issue #71).
         fakeClient.registrarAppliedAtStart.get() shouldBe true
         fakeClient.droppedFrameCount.get() shouldBe 0
+    }
+
+    @Test
+    fun `a failed start after registration deregisters the dead client`() {
+        // PR review P1: because issue #71's fix registers the client BEFORE
+        // start(), a start() that throws leaves a registered-but-dead client in
+        // Transport. Standalone startup would then run with that dead client
+        // still registered. The deregistrar (symmetric to the registrar) must be
+        // invoked with the dead client so it can be rolled back.
+        val deregistered = mutableListOf<Any>()
+        fakeClient.startThrows.set(true)
+
+        Reticulum.setLocalClientFactory { _, _ -> fakeClient }
+        Reticulum.setInterfaceRegistrar { iface ->
+            (iface as FakeClientInterface).onPacketReceived = { _, _ -> }
+            registrarApplied.set(true)
+        }
+        Reticulum.setInterfaceDeregistrar { dead -> deregistered.add(dead) }
+
+        Reticulum.start(
+            configDir = tempDir.absolutePath,
+            connectToSharedInstance = true,
+            sharedInstancePort = port,
+            transportIdentity = Identity.create(),
+        )
+
+        // The connection failed (start() threw) ...
+        Reticulum.getInstance().isConnectedToSharedInstance shouldBe false
+        // ... so the dead client must have been deregistered exactly once.
+        deregistered.size shouldBe 1
+        deregistered.single() shouldBe fakeClient
     }
 }
