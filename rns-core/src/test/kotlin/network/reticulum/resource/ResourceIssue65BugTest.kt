@@ -304,4 +304,89 @@ class ResourceIssue65BugTest {
             "AWAITING_PROOF timeout must query the proof from the network cache")
         assertEquals(ResourceConstants.AWAITING_PROOF, res.status, "a proof-cache query must not fail the transfer")
     }
+
+    @Test
+    @DisplayName("AWAITING_PROOF retry re-anchors the timeout, so the next tick does not immediately re-fire")
+    fun awaitingProofRetryReanchorsTimeout() {
+        val link = freshOutLink("issue65prf2", "reanchor")
+        primeWorkingLink(link) // 16-byte linkId before path routing
+        routeLinkToIface(link)
+        val res = senderResource(link)
+
+        // Prime AWAITING_PROOF with lastPartSent in the past so the first tick
+        // fires. Pre-fix (issue #65 / PR review P1), the gate anchored AWAITING_PROOF
+        // on last_activity, not last_part_sent: after a retry only lastPartSent was
+        // re-anchored (queryProofFromCache), lastActivity stayed old, so the gate
+        // re-tripped on the very next tick. The sender then burned every one of its
+        // retries in ~16 ticks (one per 1s watchdog cycle) instead of giving each
+        // attempt a full rtt*PROOF_TIMEOUT_FACTOR + SENDER_GRACE window, and a
+        // genuinely slow proof arrived only after the transfer had already failed.
+        set(res, Resource::class.java, "status", ResourceConstants.AWAITING_PROOF)
+        set(res, Resource::class.java, "lastPartSent", 0L)
+        set(res, Resource::class.java, "lastActivity", 0L)
+        set(res, Resource::class.java, "retriesLeft", ResourceConstants.MAX_RETRIES)
+
+        val before = res.proofCacheQueriesForTest()
+        res.watchdogTickForTest()
+        assertEquals(before + 1, res.proofCacheQueriesForTest(),
+            "the first AWAITING_PROOF timeout must query the proof once")
+
+        // The tick's recovery re-anchors lastPartSent to "now" (python
+        // Resource.py:657). A follow-up tick fired immediately must therefore see
+        // the proof window as still open and NOT issue another cache query. This
+        // is the exact regression: pre-fix the gate used lastActivity (still 0),
+        // so this second tick re-fired and queried again.
+        set(res, Resource::class.java, "retriesLeft", ResourceConstants.MAX_RETRIES)
+        val afterFirst = res.proofCacheQueriesForTest()
+        res.watchdogTickForTest()
+        assertEquals(
+            afterFirst,
+            res.proofCacheQueriesForTest(),
+            "a re-anchored AWAITING_PROOF timeout must not re-fire on the next tick (retry cadence regression)"
+        )
+    }
+
+    @Test
+    @DisplayName("prove() caches the proof packet so the sender's AWAITING_PROOF cache query can find it")
+    fun proveCachesProofPacket() {
+        val link = freshOutLink("issue65prf3", "cacheproof")
+        primeWorkingLink(link)
+        val res = senderResource(link)
+        // Prove uses the receiver-side assembled data (with metadata) to compute
+        // proof = fullHash(data + hash); a non-null assembled buffer is enough
+        // here - the point is that prove() stores the proof packet in the
+        // transport cache, not the exact proof bytes.
+        set(res, Resource::class.java, "uncompressedData", ByteArray(64) { 5 })
+
+        // Prove() calls packet.send() before Transport.cache(packet, force_cache),
+        // and send() mutates the packet (receipt/flags), so its stored packetHash
+        // is not trivially reconstructable from scratch. Instead of hashing, diff
+        // the transport cache before/after and inspect the new entry's raw bytes:
+        // the proof packet's body is proof_payload = hash + proof (64 bytes).
+        val cacheMap = @Suppress("UNCHECKED_CAST") run {
+            val f = Transport::class.java.getDeclaredField("packetCache")
+            f.isAccessible = true
+            f.get(Transport) as java.util.concurrent.ConcurrentHashMap<*, *>
+        }
+        val before = cacheMap.size
+        val beforeRaws = cacheMap.values.map { (it as Transport.CachedPacket).raw.toList() }
+
+        res.proveForTest()
+
+        // python Resource.py:759: Transport.cache(proof_packet, force_cache=True)
+        // after sending. Without this the sender's AWAITING_PROOF recovery
+        // (Transport.cache_request in queryProofFromCache) can never find the
+        // proof, so the recovery is a no-op - "lost proofs stay lost".
+        assertEquals(before + 1, cacheMap.size,
+            "prove() must store exactly one new packet (the proof) in the transport cache")
+        val newEntry = cacheMap.values
+            .map { (it as Transport.CachedPacket).raw.toList() }
+            .first { it !in beforeRaws }
+        // The proof body (hash + proof, 64 bytes) must appear in the cached raw.
+        val payload = res.hash + network.reticulum.crypto.Hashes.fullHash(ByteArray(64) { 5 } + res.hash)
+        val containsPayload = (0 until newEntry.size - payload.size + 1).any { i ->
+            (0 until payload.size).all { newEntry[i + it] == payload[it] }
+        }
+        assertTrue(containsPayload, "the cached proof packet must contain the hash+proof payload")
+    }
 }

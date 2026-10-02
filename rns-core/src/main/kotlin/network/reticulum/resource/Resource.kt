@@ -1437,6 +1437,11 @@ class Resource private constructor(
             )
 
             packet.send()
+            // python Resource.py:759: cache the proof packet (force_cache=True)
+            // so the sender's AWAITING_PROOF recovery (cache_request) can find
+            // it. Without this, queryProofFromCache is a no-op - no production
+            // path stores proofs in the cache, so the sender cannot recover.
+            Transport.cache(packet, forceCache = true)
             log("Sent proof for resource ${hash.toHexString()}")
 
         } catch (e: Exception) {
@@ -2080,11 +2085,25 @@ class Resource private constructor(
      */
     private fun watchdogTick() {
         val now = System.currentTimeMillis()
-        val idleTime = now - lastActivity
 
-        // Check for timeout
-        val timeout = (link.rtt ?: 5000L) * ResourceConstants.PART_TIMEOUT_FACTOR
-        if (idleTime <= timeout) return
+        // python parity: each watchdog state anchors its timeout on a different
+        // timestamp and factor. AWAITING_PROOF anchors on last_part_sent
+        // (Resource.py:644, re-anchored on every retry at Resource.py:657) with
+        // the proof timeout factor + sender grace, so each attempt gets a full
+        // window. Anchoring AWAITING_PROOF on last_activity (the old behaviour)
+        // kept the gate tripped after the first timeout - the proof branch then
+        // re-fired on every tick and burned all retries in ~16s, so a slow proof
+        // arrived only after the transfer had already failed.
+        val proofTimeout =
+            (link.rtt ?: 5000L) * ResourceConstants.PROOF_TIMEOUT_FACTOR +
+                ResourceConstants.SENDER_GRACE_TIME.toLong() * 1000L
+        val partTimeout = (link.rtt ?: 5000L) * ResourceConstants.PART_TIMEOUT_FACTOR
+
+        val timedOut = when (status) {
+            ResourceConstants.AWAITING_PROOF -> now - lastPartSent > proofTimeout
+            else -> now - lastActivity > partTimeout
+        }
+        if (!timedOut) return
 
         // Timed out. Dispatch the recovery action by state (python parity).
         when (status) {
@@ -2210,6 +2229,10 @@ class Resource private constructor(
     // invokes this directly instead of waiting on the background watchdog
     // thread, making the sender recovery actions deterministic.
     fun watchdogTickForTest() = watchdogTick()
+    // The receiver-side proof sender, exposed so a test can drive prove()
+    // directly (with a primed uncompressedData) and assert it stores the proof
+    // packet in the transport cache (python Resource.py:759 force_cache=True).
+    fun proveForTest() = prove()
     // The AWAITING_PROOF proof-cache query recovery counter (see proofCacheQueries).
     fun proofCacheQueriesForTest(): Int = proofCacheQueries.get()
     fun setCancelTransitionHookForTest(hook: (() -> Unit)?) {
