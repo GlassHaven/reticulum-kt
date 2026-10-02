@@ -5,6 +5,7 @@ import network.reticulum.common.DestinationType
 import network.reticulum.common.InterfaceMode
 import network.reticulum.common.PacketContext
 import network.reticulum.common.RnsConstants
+import network.reticulum.common.toKey
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
 import network.reticulum.link.Link
@@ -388,5 +389,41 @@ class ResourceIssue65BugTest {
             (0 until payload.size).all { newEntry[i + it] == payload[it] }
         }
         assertTrue(containsPayload, "the cached proof packet must contain the hash+proof payload")
+    }
+
+    @Test
+    fun `cleanCache removes expired entries and spares fresh ones`() {
+        // PR review P1: prove() now force-caches one proof per completed
+        // transfer, but the in-memory packet cache had no scheduled sweep
+        // (cleanCache() was never called; only lazy-on-read eviction in
+        // getCachedPacket), so force-cached packets that nothing re-reads
+        // accumulate for the process lifetime. runJobs() now schedules
+        // cleanCache() (python Transport.py:951-956). This test drives the
+        // sweep directly: an expired entry must be removed, a fresh one kept.
+        val cacheMap = @Suppress("UNCHECKED_CAST") run {
+            val f = Transport::class.java.getDeclaredField("packetCache")
+            f.isAccessible = true
+            f.get(Transport) as java.util.concurrent.ConcurrentHashMap<Any, Any>
+        }
+        // Reset the throttle so cleanCache() runs this call, regardless of when
+        // Transport.start() last set it.
+        val throttle = Transport::class.java.getDeclaredField("packetCacheLastCleaned")
+        throttle.isAccessible = true
+        throttle.set(Transport, 0L)
+
+        val now = System.currentTimeMillis()
+        val timeout = 60L * 60 * 1000 // TransportConstants.PACKET_CACHE_TIMEOUT
+        val freshHash = ByteArray(32) { 0x11 }
+        val expiredHash = ByteArray(32) { 0x22 }
+        cacheMap[freshHash.toKey()] = Transport.CachedPacket(ByteArray(8) { 1 }, now, null)
+        cacheMap[expiredHash.toKey()] = Transport.CachedPacket(ByteArray(8) { 2 }, now - 2 * timeout, null)
+
+        Transport.cleanCache()
+
+        // The expired entry is gone, the fresh one survives.
+        assertTrue(!cacheMap.containsKey(expiredHash.toKey()),
+            "cleanCache must remove an entry past its TTL")
+        assertTrue(cacheMap.containsKey(freshHash.toKey()),
+            "cleanCache must spare an entry still within its TTL")
     }
 }
