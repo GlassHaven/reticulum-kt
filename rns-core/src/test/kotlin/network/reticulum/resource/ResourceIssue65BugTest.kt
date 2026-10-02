@@ -152,6 +152,10 @@ class ResourceIssue65BugTest {
     @AfterEach
     fun teardown() {
         Resource.watchdogDisabledForTest = false
+        // The cache-sweep test pauses the job loop; restore it so later tests
+        // running against the shared Transport singleton are not affected
+        // (start()/stop() do not reset paused themselves).
+        Transport.paused.set(false)
         try {
             Transport.deregisterInterface(iface)
         } catch (_: Exception) {
@@ -405,6 +409,12 @@ class ResourceIssue65BugTest {
             f.isAccessible = true
             f.get(Transport) as java.util.concurrent.ConcurrentHashMap<Any, Any>
         }
+        // Pause the job loop so its periodic cleanCache() can't race this test:
+        // if it swept between us resetting the throttle and inserting the
+        // expired entry, it would reset the timer and our cleanCache() call
+        // below would be a no-op, failing the test even though cleanup works.
+        // cleanCache() itself does not consult paused, so it still runs.
+        Transport.paused.set(true)
         // Reset the throttle so cleanCache() runs this call, regardless of when
         // Transport.start() last set it.
         val throttle = Transport::class.java.getDeclaredField("packetCacheLastCleaned")
