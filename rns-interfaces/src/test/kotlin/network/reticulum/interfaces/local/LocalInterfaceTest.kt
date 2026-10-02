@@ -374,6 +374,71 @@ class LocalInterfaceTest {
         )
     }
 
+    /**
+     * Registration failure regression: when Transport.registerInterface throws
+     * (the JVM/coroutine pragmatic that motivated the try/catch in
+     * handleNewClient), the spawned child must be rolled back cleanly:
+     * removed from clients and spawnedInterfaces, the socket closed, and the
+     * read loop never started. Exercises the catch block that is otherwise
+     * unreachable in normal operation (registerInterface realistically never
+     * throws).
+     */
+    @Test
+    fun `registration failure rolls back the spawned child and closes the socket`() {
+        val tcpPort = 37436
+        val baselineClients = Transport.localClientCount()
+        val hookInvocations = AtomicInteger(0)
+
+        val srv = LocalServerInterface(name = "RegFailServer", tcpPort = tcpPort)
+        srv.registerInterfaceForTest = { _ ->
+            hookInvocations.incrementAndGet()
+            throw IllegalStateException("simulated registration failure")
+        }
+        srv.start()
+
+        // Connect a socket; handleNewClient will add the child to clients,
+        // then invoke the hook (which throws), then the catch block rolls back.
+        val probe = Socket()
+        probe.connect(InetSocketAddress("127.0.0.1", tcpPort), 1000)
+        probe.close()
+
+        // Wait for the accept loop to process the connection (the hook must
+        // run exactly once - proof the connection reached handleNewClient and
+        // the simulated registration-failure path was entered).
+        val deadline = System.currentTimeMillis() + 3000
+        while (System.currentTimeMillis() < deadline && hookInvocations.get() < 1) {
+            Thread.sleep(10)
+        }
+        assertEquals(
+            1,
+            hookInvocations.get(),
+            "The simulated registration hook was not invoked; the test cannot " +
+                "confirm the registration-failure path ran"
+        )
+
+        // Wait for the catch block to roll the child back out of clients.
+        val deadline2 = System.currentTimeMillis() + 3000
+        while (System.currentTimeMillis() < deadline2 && srv.clientCount() > 0) {
+            Thread.sleep(10)
+        }
+
+        // The spawned child was rolled back by the catch block.
+        assertEquals(
+            0,
+            srv.clientCount(),
+            "Server should have rolled back the spawned child after registration failure"
+        )
+        // No stale entry in Transport (the hook threw, so registerInterface
+        // was never called; the catch must not have added one either).
+        assertEquals(
+            baselineClients,
+            Transport.localClientCount(),
+            "Transport.localClientInterfaces should be unchanged after registration failure"
+        )
+
+        srv.detach()
+    }
+
     @Test
     fun `test bidirectional communication via TCP`() {
         val tcpPort = 37433

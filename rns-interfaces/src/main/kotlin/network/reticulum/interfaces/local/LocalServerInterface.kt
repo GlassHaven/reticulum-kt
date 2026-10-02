@@ -12,6 +12,7 @@ import kotlinx.coroutines.withContext
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import network.reticulum.interfaces.toRef
+import network.reticulum.transport.InterfaceRef
 import network.reticulum.transport.Transport
 import java.io.File
 import java.io.IOException
@@ -105,6 +106,14 @@ class LocalServerInterface : Interface {
 
     private val clientCounter = AtomicInteger(0)
     private val clients = CopyOnWriteArrayList<LocalClientInterface>()
+
+    /**
+     * Test seam: when non-null, [handleNewClient] invokes this hook in place of
+     * [Transport.registerInterface] for the spawned client, so a test can
+     * simulate the registration-failure path (the failure mode the try/catch in
+     * [handleNewClient] was added to contain). Null in production.
+     */
+    internal var registerInterfaceForTest: ((InterfaceRef) -> Unit)? = null
 
     override val bitrate: Int = BITRATE
     override val hwMtu: Int = HW_MTU
@@ -353,7 +362,16 @@ class LocalServerInterface : Interface {
         // registration and roll back the prior `clients` / `spawnedInterfaces`
         // adds if registration fails.
         val registered = try {
-            Transport.registerInterface(clientInterface.toRef())
+            // Test seam: when set, the hook replaces the Transport registration
+            // call so a test can simulate a registration failure (the failure
+            // mode the try/catch below was added to contain). Null in
+            // production - the real registerInterface runs.
+            val registerHook = registerInterfaceForTest
+            if (registerHook != null) {
+                registerHook.invoke(clientInterface.toRef())
+            } else {
+                Transport.registerInterface(clientInterface.toRef())
+            }
             true
         } catch (e: Exception) {
             log("Could not register spawned interface with Transport: ${e.message}")
