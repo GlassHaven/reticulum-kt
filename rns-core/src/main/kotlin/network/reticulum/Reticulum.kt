@@ -624,16 +624,20 @@ class Reticulum private constructor(
             // Start Transport (without transport routing) so inbound() works
             Transport.start(transportIdentity = transportIdentity, enableTransport = false)
 
-            // Start the interface
-            clientInterface::class.java.getMethod("start").invoke(clientInterface)
-
-            // Register with Transport so packets flow through
+            // Register with Transport so packets flow through. This MUST run
+            // before start() below: start() connects the TCP socket and
+            // launches the read loop, so a frame arriving in the gap between
+            // start() and registrar wiring would hit a null onPacketReceived
+            // and be silently dropped (issue #71).
             val registrar = interfaceRegistrar
             if (registrar != null) {
                 registrar(clientInterface)
             } else {
                 log("WARNING: No interface registrar set, packets will not be processed")
             }
+
+            // Start the interface
+            clientInterface::class.java.getMethod("start").invoke(clientInterface)
 
             // Set state only after all steps succeed (matches Python Reticulum.py:414-416)
             sharedInterface = clientInterface
