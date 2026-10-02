@@ -1,5 +1,6 @@
 package network.reticulum.android.db.store
 
+import android.database.SQLException
 import android.database.sqlite.SQLiteDatabaseLockedException
 import network.reticulum.android.db.dao.IdentityRatchetDao
 import network.reticulum.android.db.dao.KnownDestinationDao
@@ -363,6 +364,88 @@ class RoomIdentityStoreTest {
         assertEquals(99L, second.second)
     }
 
+    /**
+     * The third of the three write operations the store routes through
+     * [submitWriteThroughDurable] is the range delete [removeExpiredRatchets].
+     * It was previously the only one with no coverage. It uses a synthetic
+     * row key (`"expiry-delete"` / empty hash) that the coalescing logic treats
+     * differently from the per-dest-hash upserts, so it needs its own test.
+     *
+     * Two sub-cases:
+     * 1. One transient lock: retried and committed (delete fires).
+     * 2. Retry exhaustion: the range delete goes PENDING (never dropped) and
+     *    reconciles on the next successful write.
+     */
+    @Test
+    fun `removeExpiredRatchets retries one SQLITE_BUSY lock and the delete fires`() {
+        val dao = FailFirstDeleteRatchetDao(
+            firstCallFailure = SQLiteDatabaseLockedException("database is locked (code 5 SQLITE_BUSY)")
+        )
+        val store = RoomIdentityStore(NoopKnownDestinationDao(), dao, DirectExecutorService())
+
+        // The first (and only) delete hits one transient lock; it must be
+        // retried and the delete must still fire. No exception may escape.
+        store.removeExpiredRatchets(maxAgeMs = 1000L)
+
+        // First attempt locked, second committed: 2 delete calls total.
+        assertEquals(2, dao.deleteCount)
+        assertNotNull(dao.lastThreshold)
+    }
+
+    @Test
+    fun `removeExpiredRatchets retry exhaustion keeps the delete pending and reconciles on the next successful write`() {
+        // Locks for the first 3 delete calls (the whole bounded budget), then
+        // commits. The range delete must exhaust the budget and go PENDING,
+        // not be dropped; a later successful durable write (an upsert) must
+        // flush the pending delete into Room.
+        val dao = LockThenCommitDeleteRatchetDao(
+            lockCalls = 3,
+            lock = SQLiteDatabaseLockedException("database is locked (code 5 SQLITE_BUSY)")
+        )
+        val store = RoomIdentityStore(NoopKnownDestinationDao(), dao, DirectExecutorService())
+
+        // Range delete: the lock persists through the whole bounded retry
+        // budget. The delete must be kept PENDING, not permanently dropped.
+        store.removeExpiredRatchets(maxAgeMs = 1000L)
+        assertEquals(3, dao.deleteCount)
+        assertNull(dao.lastThreshold) // not yet committed
+
+        // A successful ratchet upsert proves the lock cleared; it must flush
+        // the pending range delete. Pre-fix the exhaustion branch drops the
+        // delete, so it never fires and this assertion fails (red).
+        store.upsertRatchet(byteArrayOf(1), byteArrayOf(7, 8, 9), timestampMs = 42L)
+
+        assertNotNull(dao.lastThreshold)
+    }
+
+    /**
+     * A non-lock [SQLException] (e.g. SQLITE_FULL on a device low on storage)
+     * is NOT a transient lock: [attemptDurableWrite] drops the write
+     * immediately (no retry, no pending), matching the [submitWriteThrough]
+     * close-race / transient-error policy. A test pins that a non-lock error
+     * does NOT get retried or kept pending - only [SQLiteDatabaseLockedException]
+     * gets the bounded retry budget.
+     */
+    @Test
+    fun `a non-lock SQLException on a durable write is dropped immediately without retry or pending`() {
+        val dao = FailAlwaysRatchetDao(
+            failure = android.database.sqlite.SQLiteFullException("database or disk is full")
+        )
+        val store = RoomIdentityStore(NoopKnownDestinationDao(), dao, DirectExecutorService())
+
+        // First write: non-lock error -> dropped immediately (exactly 1 attempt).
+        store.upsertRatchet(byteArrayOf(1), byteArrayOf(7, 8, 9), timestampMs = 42L)
+        assertEquals(1, dao.upsertCount)
+        assertNull(store.getRatchet(byteArrayOf(1)))
+
+        // A second write for a DIFFERENT key: also dropped immediately. No
+        // pending reconciliation should fire the first (dropped) write's DAO
+        // block a second time - dropped writes are removed, not kept.
+        store.upsertRatchet(byteArrayOf(2), byteArrayOf(10, 11, 12), timestampMs = 99L)
+        // 1 (first, dropped) + 1 (second, dropped) = 2 total; no flush re-attempt.
+        assertEquals(2, dao.upsertCount)
+    }
+
     private fun sampleIdentityData() = IdentityData(
         timestamp = 1L,
         packetHash = byteArrayOf(2, 3),
@@ -496,6 +579,76 @@ class RoomIdentityStoreTest {
         override fun getByHash(destHash: ByteArray): IdentityRatchetEntity? =
             committed[destHash.toKey()]
 
+        override fun deleteExpiredBefore(thresholdMs: Long) = Unit
+    }
+
+    /**
+     * DAO that fails the FIRST deleteExpiredBefore call with a given exception,
+     * then succeeds. Tracks how many times the delete was invoked and the last
+     * threshold seen, so tests can assert the delete fired and that the first
+     * attempt was retried.
+     */
+    private class FailFirstDeleteRatchetDao(
+        private val firstCallFailure: Exception,
+    ) : IdentityRatchetDao {
+        var deleteCount = 0
+        var lastThreshold: Long? = null
+
+        override fun upsert(entity: IdentityRatchetEntity) = Unit
+        override fun getByHash(destHash: ByteArray): IdentityRatchetEntity? = null
+        override fun deleteExpiredBefore(thresholdMs: Long) {
+            deleteCount++
+            if (deleteCount == 1) throw firstCallFailure
+            lastThreshold = thresholdMs
+        }
+    }
+
+    /**
+     * DAO that locks the first `lockCalls` deleteExpiredBefore calls (used to
+     * exhaust the bounded retry budget), then commits. The upsert path is
+     * always-success (used as the "lock cleared" trigger that flushes the
+     * pending range delete). Tracks whether a delete ever committed.
+     */
+    private class LockThenCommitDeleteRatchetDao(
+        private val lockCalls: Int,
+        private val lock: Exception,
+    ) : IdentityRatchetDao {
+        var deleteCount = 0
+        var upsertCount = 0
+        var lastThreshold: Long? = null
+        private val committed = mutableMapOf<ByteArrayKey, IdentityRatchetEntity>()
+
+        override fun upsert(entity: IdentityRatchetEntity) {
+            upsertCount++
+            committed[entity.destHash.toKey()] = entity
+        }
+
+        override fun getByHash(destHash: ByteArray): IdentityRatchetEntity? =
+            committed[destHash.toKey()]
+
+        override fun deleteExpiredBefore(thresholdMs: Long) {
+            deleteCount++
+            if (deleteCount <= lockCalls) throw lock
+            lastThreshold = thresholdMs
+        }
+    }
+
+    /**
+     * DAO that ALWAYS fails upsert with a non-lock SQLException (e.g.
+     * SQLITE_FULL). Used to verify the DROPPED path: no retry, no pending,
+     * no flush re-attempt. The delete path is a no-op.
+     */
+    private class FailAlwaysRatchetDao(
+        private val failure: Exception,
+    ) : IdentityRatchetDao {
+        var upsertCount = 0
+
+        override fun upsert(entity: IdentityRatchetEntity) {
+            upsertCount++
+            throw failure
+        }
+
+        override fun getByHash(destHash: ByteArray): IdentityRatchetEntity? = null
         override fun deleteExpiredBefore(thresholdMs: Long) = Unit
     }
 
