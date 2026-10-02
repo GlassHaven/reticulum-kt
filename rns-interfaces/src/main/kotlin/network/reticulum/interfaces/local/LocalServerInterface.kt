@@ -115,7 +115,7 @@ class LocalServerInterface : Interface {
      * transports (Unix / abstract sockets) or before [start] has bound.
      */
     val boundPort: Int
-        get() = serverSocket?.localPort ?: 0
+        get() = serverSocket?.takeIf { it.isBound }?.localPort ?: 0
 
     override val bitrate: Int = BITRATE
     override val hwMtu: Int = HW_MTU

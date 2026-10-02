@@ -61,6 +61,25 @@ class LocalInterfaceTest {
     }
 
     @Test
+    fun `boundPort reports zero, not the unbound socket port, when the socket exists but is unbound`() {
+        // Regression (PR review P2): startTcpSocket() does `serverSocket = ServerSocket()`
+        // then `serverSocket?.bind(...)`. If bind() throws (port in use / TIME_WAIT),
+        // an unbound ServerSocket is left in place. `ServerSocket.localPort` on an
+        // unbound socket is -1, and the old `serverSocket?.localPort ?: 0` only elided
+        // null - so boundPort returned -1 instead of the documented 0. A caller
+        // checking the port after a failed start got neither a usable port nor the
+        // promised fallback. The fix gates on isBound.
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
+        // Put an unbound ServerSocket in the private field (simulating a failed bind),
+        // without calling start().
+        val f = LocalServerInterface::class.java.getDeclaredField("serverSocket")
+        f.isAccessible = true
+        f.set(server, java.net.ServerSocket()) // unbound
+
+        assertEquals(0, server!!.boundPort, "an unbound serverSocket must report 0, not -1")
+    }
+
+    @Test
     fun `test client connects to server via TCP`() {
         // Start server
         server = LocalServerInterface(name = "TestServer", tcpPort = 0)
