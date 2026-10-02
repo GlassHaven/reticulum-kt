@@ -1240,6 +1240,57 @@ private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (
         result(*entries.toTypedArray())
     }
 
+    "wire_register_destination" -> {
+        // Probe the explicit destination-registration guard in isolation.
+        // Constructs a destination of the requested direction, clears it from
+        // the local-destination table (so construction-time auto-registration
+        // does not contaminate the result), performs ONE explicit register -
+        // the production send-path trigger (Reticulum.registerDestination ->
+        // Transport.registerDestination) - and reports whether the hash then
+        // lands in the local table. That membership drives the announce-skip
+        // gate (Transport.kt:3648 destinations.any / Transport.py:1710
+        // destinations_map). reticulum-kt #85: registerDestination is missing
+        // Python's IN-direction guard, so an OUT destination wrongly becomes
+        // "local" and its announces are skipped. IN is the positive control.
+        val handle = p.str("handle")
+        val direction = p.str("direction").uppercase()
+        val appName = p.str("app_name")
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: emptyArray()
+
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val rnsDirection =
+            if (direction == "IN") DestinationDirection.IN else DestinationDirection.OUT
+        val identity = Identity.create()
+        val destination = Destination.create(
+            identity = identity,
+            direction = rnsDirection,
+            type = DestinationType.SINGLE,
+            appName = appName,
+            aspects = aspects,
+        )
+
+        // Clear any construction-time registration so the explicit register
+        // below is the single unit under test (kotlin auto-registers IN only).
+        Transport.deregisterDestination(destination)
+
+        // The explicit register - the divergent unit. Python filters
+        // direction == IN (Transport.py:2898); the unguarded kotlin port
+        // (Transport.kt:1000) appends every direction.
+        Transport.registerDestination(destination)
+
+        val isLocal = Transport.findDestination(destination.hash) != null
+
+        result(
+            "destination_hash" to hexVal(destination.hash),
+            "identity_hash" to hexVal(identity.hash),
+            "direction" to strVal(direction),
+            "is_local" to boolVal(isLocal),
+        )
+    }
+
     "wire_poll_path" -> {
         val handle = p.str("handle")
         val destHash = p.hex("destination_hash")
