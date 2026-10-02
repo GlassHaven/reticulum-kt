@@ -1,7 +1,9 @@
 package network.reticulum
 
 import io.kotest.matchers.shouldBe
+import network.reticulum.common.RnsConstants
 import network.reticulum.identity.Identity
+import network.reticulum.transport.InterfaceRef
 import network.reticulum.transport.Transport
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
@@ -63,6 +65,23 @@ class ReticulumSharedInstanceStartupOrderTest {
         fun detach() {}
     }
 
+    /**
+     * Minimal real InterfaceRef. The fake registrar/deregistrar use it to do
+     * actual Transport.registerInterface/deregisterInterface work, so the
+     * rollback test can assert the dead client is really removed from Transport
+     * (not just that a callback lambda ran) - a no-op production callback would
+     * leave the ref registered and fail the assertion.
+     */
+    private class FakeRef(override val name: String, hashBytes: ByteArray) : InterfaceRef {
+        override val hash: ByteArray = hashBytes
+        override val canSend: Boolean = true
+        override val canReceive: Boolean = true
+        override val online: Boolean = true
+        override var tunnelId: ByteArray? = null
+        override var wantsTunnel: Boolean = false
+        override fun send(data: ByteArray) { /* no-op: the test only registers/deregisters this ref */ }
+    }
+
     private val tempDir = Files.createTempDirectory("rns-shared-instance-order").toFile()
     private lateinit var serverSocket: ServerSocket
     private lateinit var fakeClient: FakeClientInterface
@@ -115,21 +134,40 @@ class ReticulumSharedInstanceStartupOrderTest {
     }
 
     @Test
-    fun `a failed start after registration deregisters the dead client`() {
+    fun `a failed start after registration removes the dead client from Transport`() {
         // PR review P1: because issue #71's fix registers the client BEFORE
         // start(), a start() that throws leaves a registered-but-dead client in
         // Transport. Standalone startup would then run with that dead client
         // still registered. The deregistrar (symmetric to the registrar) must be
-        // invoked with the dead client so it can be rolled back.
-        val deregistered = mutableListOf<Any>()
+        // invoked with the dead client so it is rolled back.
+        //
+        // The fake registrar/deregistrar do REAL Transport work (this mirrors
+        // the production callbacks: InterfaceAdapter.getOrCreate + Transport
+        // register/deregisterInterface). So the assertion below proves the
+        // dead client is actually gone from Transport - a no-op production
+        // deregistrar would leave the ref registered and fail it.
+        val clientHash = ByteArray(RnsConstants.TRUNCATED_HASH_BYTES) { 0x5E }
+        // One shared ref instance: deregisterInterface removes by reference
+        // (List.remove), so the registrar and deregistrar must use the SAME
+        // instance - mirroring InterfaceAdapter.getOrCreate, which caches and
+        // returns the same ref for the same interface.
+        val deadRef = FakeRef("dead-client", clientHash)
+        val registered = AtomicBoolean(false)
+        val deregistered = AtomicBoolean(false)
         fakeClient.startThrows.set(true)
 
         Reticulum.setLocalClientFactory { _, _ -> fakeClient }
         Reticulum.setInterfaceRegistrar { iface ->
             (iface as FakeClientInterface).onPacketReceived = { _, _ -> }
             registrarApplied.set(true)
+            Transport.registerInterface(deadRef)
+            registered.set(true)
         }
-        Reticulum.setInterfaceDeregistrar { dead -> deregistered.add(dead) }
+        Reticulum.setInterfaceDeregistrar { dead ->
+            @Suppress("UNUSED_EXPRESSION") dead
+            Transport.deregisterInterface(deadRef)
+            deregistered.set(true)
+        }
 
         Reticulum.start(
             configDir = tempDir.absolutePath,
@@ -140,8 +178,11 @@ class ReticulumSharedInstanceStartupOrderTest {
 
         // The connection failed (start() threw) ...
         Reticulum.getInstance().isConnectedToSharedInstance shouldBe false
-        // ... so the dead client must have been deregistered exactly once.
-        deregistered.size shouldBe 1
-        deregistered.single() shouldBe fakeClient
+        // ... the registrar really registered the client, ...
+        registered.get() shouldBe true
+        // ... and the rollback really removed it from Transport (not just that
+        // a callback lambda ran).
+        deregistered.get() shouldBe true
+        Transport.findInterfaceByHashForTest(clientHash) shouldBe null
     }
 }
