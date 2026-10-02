@@ -1261,8 +1261,13 @@ private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (
         wireInstances[handle]
             ?: throw IllegalArgumentException("Unknown handle: $handle")
 
-        val rnsDirection =
-            if (direction == "IN") DestinationDirection.IN else DestinationDirection.OUT
+        val rnsDirection = when (direction) {
+            "IN" -> DestinationDirection.IN
+            "OUT" -> DestinationDirection.OUT
+            else -> throw IllegalArgumentException(
+                "direction must be IN or OUT, got: $direction"
+            )
+        }
         val identity = Identity.create()
         val destination = Destination.create(
             identity = identity,
@@ -1282,6 +1287,13 @@ private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (
         Transport.registerDestination(destination)
 
         val isLocal = Transport.findDestination(destination.hash) != null
+
+        // Tear down the probe: this command's whole job was to observe the
+        // register behavior in isolation, so the destination must not linger
+        // in the shared Transport table (a long-lived bridge accumulates one
+        // per call, and later commands read that same table). The hashes and
+        // is_local above were already captured, so removing it now is safe.
+        Transport.deregisterDestination(destination)
 
         result(
             "destination_hash" to hexVal(destination.hash),
