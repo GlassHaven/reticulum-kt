@@ -46,11 +46,27 @@ class LocalInterfaceTest {
     }
 
     @Test
+    fun `boundPort reports the actual ephemeral port after TCP bind`() {
+        // Construct with port 0 so the OS assigns an ephemeral port, then read it back.
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
+        server!!.start()
+
+        val port = server!!.boundPort
+        assertTrue(port > 0, "Expected a non-zero ephemeral port after bind, got $port")
+
+        // The reported port must actually accept connections.
+        Socket().use { s ->
+            s.connect(InetSocketAddress("127.0.0.1", port), 1000)
+        }
+    }
+
+    @Test
     fun `test client connects to server via TCP`() {
         // Start server
-        val tcpPort = 37428
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
+
+        val tcpPort = server!!.boundPort
 
         // Start client
         val client = LocalClientInterface(name = "TestClient", tcpPort = tcpPort)
@@ -67,19 +83,19 @@ class LocalInterfaceTest {
 
     @Test
     fun `test packet transmission from client to server via TCP`() {
-        val tcpPort = 37429
         // Data must be > HEADER_MIN_SIZE (19) bytes to pass HDLC deframer validation
         val testData = "Hello from client!!!!".toByteArray()
         val receivedLatch = CountDownLatch(1)
         var receivedData: ByteArray? = null
 
-        // Start server
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        // Start server on an OS-assigned ephemeral port
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.onPacketReceived = { data, _ ->
             receivedData = data
             receivedLatch.countDown()
         }
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         // Start client
         val client = LocalClientInterface(name = "TestClient", tcpPort = tcpPort)
@@ -100,15 +116,15 @@ class LocalInterfaceTest {
 
     @Test
     fun `test packet transmission from server to client via TCP`() {
-        val tcpPort = 37430
         // Data must be > HEADER_MIN_SIZE (19) bytes to pass HDLC deframer validation
         val testData = "Hello from server!!!!".toByteArray()
         val receivedLatch = CountDownLatch(1)
         var receivedData: ByteArray? = null
 
-        // Start server
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        // Start server on an OS-assigned ephemeral port
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         // Start client
         val client = LocalClientInterface(name = "TestClient", tcpPort = tcpPort)
@@ -135,16 +151,16 @@ class LocalInterfaceTest {
 
     @Test
     fun `test broadcast to multiple clients via TCP`() {
-        val tcpPort = 37431
         // Data must be > HEADER_MIN_SIZE (19) bytes to pass HDLC deframer validation
         val testData = "Broadcast message!!!!!".toByteArray()
         val numClients = 3
         val receivedLatch = CountDownLatch(numClients)
         val receivedDataList = mutableListOf<ByteArray>()
 
-        // Start server
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        // Start server on an OS-assigned ephemeral port
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         // Start multiple clients
         repeat(numClients) { i ->
@@ -183,11 +199,10 @@ class LocalInterfaceTest {
 
     @Test
     fun `test client disconnect via TCP`() {
-        val tcpPort = 37432
-
-        // Start server
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        // Start server on an OS-assigned ephemeral port
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         // Start client
         val client = LocalClientInterface(name = "TestClient", tcpPort = tcpPort)
@@ -264,20 +279,20 @@ class LocalInterfaceTest {
      */
     @Test
     fun `long-lived spawned child keeps draining inbound bytes under sibling probe churn`() {
-        val tcpPort = 37435
         val numRounds = 50
         val probesPerRound = 5
         val packetData = "Long-lived client packet >>>".toByteArray()
 
         val receivedCount = AtomicInteger(0)
 
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.onPacketReceived = { data, _ ->
             if (data.contentEquals(packetData)) {
                 receivedCount.incrementAndGet()
             }
         }
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         val client = LocalClientInterface(name = "LongLivedClient", tcpPort = tcpPort)
         clients.add(client)
@@ -327,7 +342,6 @@ class LocalInterfaceTest {
 
     @Test
     fun `test bidirectional communication via TCP`() {
-        val tcpPort = 37433
         // Data must be > HEADER_MIN_SIZE (19) bytes to pass HDLC deframer validation
         val clientToServerData = "Client to server!!!!!".toByteArray()
         val serverToClientData = "Server to client!!!!!".toByteArray()
@@ -338,13 +352,14 @@ class LocalInterfaceTest {
         var serverReceived: ByteArray? = null
         var clientReceived: ByteArray? = null
 
-        // Start server
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        // Start server on an OS-assigned ephemeral port
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.onPacketReceived = { data, _ ->
             serverReceived = data
             serverReceivedLatch.countDown()
         }
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         // Start client
         val client = LocalClientInterface(name = "TestClient", tcpPort = tcpPort)
