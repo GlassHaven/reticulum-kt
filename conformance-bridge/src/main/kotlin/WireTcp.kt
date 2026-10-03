@@ -5529,22 +5529,15 @@ private fun handleWireCmd6(command: String, p: JsonObject): JsonObject? = when (
             return Transport.getCachedPacket(rebuilt.packetHash) != null
         }
 
-        // Feed every part; the last triggers assemble() -> prove() synchronously
-        // (prove sends the RESOURCE_PRF and, when #97 lands, force-caches it).
-        // Poll the recovery lookup for a short window: it turns true only once
-        // prove()'s cache write is committed, so a conforming impl returns True and
-        // a non-conforming one (no cache call) stays False until the window elapses.
+        // Feed every part. In this port assemble() runs synchronously inside the
+        // last receivePart (Resource.receivePart -> assemble, same thread), so by
+        // the time the loop returns the transfer is fully concluded and, on a
+        // conforming impl, prove()'s cache write has committed. A single recovery
+        // lookup is therefore sufficient - no poll loop is needed (unlike the
+        // reference, where assemble runs in a separate thread).
         for (i in 0 until total) receiver.receivePart(sender.parts[i]!!)
         val payload = receiver.proofPayloadForTest()
-        var inCache = false
-        val deadline = System.currentTimeMillis() + 1500
-        while (System.currentTimeMillis() < deadline) {
-            if (receiver.status == ResourceConstants.COMPLETE && payload != null) {
-                inCache = recoveryLookup(payload)
-                if (inCache) break
-            }
-            Thread.sleep(20)
-        }
+        val inCache = if (payload != null) recoveryLookup(payload) else false
         val status = receiver.status
         val complete = status == ResourceConstants.COMPLETE
         val out = result(
