@@ -419,6 +419,7 @@ class Resource private constructor(
     // conformance instrumentation — no python equivalent.)
     private val proveCalls = AtomicInteger(0)
     @Volatile private var lastProofPayload: ByteArray? = null
+    @Volatile private var lastProofLinkRef: Boolean = false
     @Volatile private var lastRequestData: ByteArray? = null
     private val requestNextEmitCount = AtomicInteger(0)
     private val hmuRequestsSent = AtomicInteger(0)
@@ -1316,6 +1317,17 @@ class Resource private constructor(
                 mtu = link.mtu
             )
 
+            // Observation-only: does the proof packet carry a link reference at
+            // the moment it is sent? Python's RNS.Packet(link, ...) always sets
+            // packet.destination = link, and the Transport's LINK-packet routing
+            // (the interface filter at Transport.py:1031-1035 and the in-process
+            // loopback) reads that reference to send the proof only on the link's
+            // own interface. A packet built without the reference (createRaw
+            // leaves link == null) falls through to broadcast-on-all-interfaces
+            // (Transport.kt:3368). This is the invariant the conformance test
+            // asserts; the fix is to set packet.link = link (Link.kt idiom).
+            lastProofLinkRef = packet.link != null
+
             packet.send()
             log("Sent proof for resource ${hash.toHexString()}")
 
@@ -2014,6 +2026,10 @@ class Resource private constructor(
     /** The unencrypted proof payload the last prove() built (hash + proof).
      *  Returns a defensive copy so callers cannot mutate the stored observation. */
     fun proofPayloadForTest(): ByteArray? = lastProofPayload?.copyOf()
+    /** Whether the last prove()'s packet carried a link reference at send time
+     *  (python RNS.Packet(link, ...) always does; the Transport routes LINK
+     *  packets to the link's own interface via that reference). */
+    fun proofLinkRefForTest(): Boolean = lastProofLinkRef
     fun lastRequestDataForTest(): ByteArray? = lastRequestData
     fun requestNextEmitCountForTest(): Int = requestNextEmitCount.get()
     fun hmuRequestsSentForTest(): Int = hmuRequestsSent.get()

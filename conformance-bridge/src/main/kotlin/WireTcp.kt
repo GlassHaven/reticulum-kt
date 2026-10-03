@@ -5554,6 +5554,14 @@ private fun handleWireCmd6(command: String, p: JsonObject): JsonObject? = when (
             "proof_sent" to boolVal(payload != null),
             "proof_in_cache" to boolVal(inCache),
             "proof_recovered" to boolVal(inCache),
+            // proof_link_ref: did prove() set packet.link on the proof packet
+            // before calling send()? Python's RNS.Packet(link, ...) always does;
+            // the Transport's LINK-packet interface filter (Transport.py:1031-1035)
+            // and in-process loopback both depend on it. A packet built without
+            // the reference (createRaw leaves link == null) broadcasts on all
+            // interfaces in a multi-interface production setup and cannot use
+            // the same-process loopback optimization.
+            "proof_link_ref" to boolVal(receiver.proofLinkRefForTest()),
         )
         runCatching { receiver.cancel() }
         out
