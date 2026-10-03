@@ -1240,6 +1240,69 @@ private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (
         result(*entries.toTypedArray())
     }
 
+    "wire_register_destination" -> {
+        // Probe the explicit destination-registration guard in isolation.
+        // Constructs a destination of the requested direction, clears it from
+        // the local-destination table (so construction-time auto-registration
+        // does not contaminate the result), performs ONE explicit register -
+        // the production send-path trigger (Reticulum.registerDestination ->
+        // Transport.registerDestination) - and reports whether the hash then
+        // lands in the local table. That membership drives the announce-skip
+        // gate (Transport.kt:3648 destinations.any / Transport.py:1710
+        // destinations_map). reticulum-kt #85: registerDestination is missing
+        // Python's IN-direction guard, so an OUT destination wrongly becomes
+        // "local" and its announces are skipped. IN is the positive control.
+        val handle = p.str("handle")
+        val direction = p.str("direction").uppercase()
+        val appName = p.str("app_name")
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: emptyArray()
+
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val rnsDirection = when (direction) {
+            "IN" -> DestinationDirection.IN
+            "OUT" -> DestinationDirection.OUT
+            else -> throw IllegalArgumentException(
+                "direction must be IN or OUT, got: $direction"
+            )
+        }
+        val identity = Identity.create()
+        val destination = Destination.create(
+            identity = identity,
+            direction = rnsDirection,
+            type = DestinationType.SINGLE,
+            appName = appName,
+            aspects = aspects,
+        )
+
+        // Clear any construction-time registration so the explicit register
+        // below is the single unit under test (kotlin auto-registers IN only).
+        Transport.deregisterDestination(destination)
+
+        // The explicit register - the divergent unit. Python filters
+        // direction == IN (Transport.py:2898); the unguarded kotlin port
+        // (Transport.kt:1000) appends every direction.
+        Transport.registerDestination(destination)
+
+        val isLocal = Transport.findDestination(destination.hash) != null
+
+        // Tear down the probe: this command's whole job was to observe the
+        // register behavior in isolation, so the destination must not linger
+        // in the shared Transport table (a long-lived bridge accumulates one
+        // per call, and later commands read that same table). The hashes and
+        // is_local above were already captured, so removing it now is safe.
+        Transport.deregisterDestination(destination)
+
+        result(
+            "destination_hash" to hexVal(destination.hash),
+            "identity_hash" to hexVal(identity.hash),
+            "direction" to strVal(direction),
+            "is_local" to boolVal(isLocal),
+        )
+    }
+
     "wire_poll_path" -> {
         val handle = p.str("handle")
         val destHash = p.hex("destination_hash")
@@ -5420,6 +5483,91 @@ private fun handleWireCmd6(command: String, p: JsonObject): JsonObject? = when (
             "proofs_after_assembly" to intVal(receiver.proveCallCountForTest()),
             "status_name" to strVal(ResourceConstants.statusDescription(status)),
             "complete" to boolVal(status == ResourceConstants.COMPLETE),
+        )
+        runCatching { receiver.cancel() }
+        out
+    }
+
+    "wire_resource_proof_cache_lookup" -> {
+        // Proof caching (receiver side, Resource.prove, python Resource.py:752-759).
+        // When a receiver completes a transfer it proves it (sends a single
+        // RESOURCE_PRF) AND force-caches the proof packet so the sender's
+        // AWAITING_PROOF recovery (cacheRequest, python Resource.py:653-656) can
+        // re-fetch a lost proof. reticulum-kt main's prove() sends but does NOT
+        // cache - the proof is "lost" even though generated (#65 / PR #97).
+        //
+        // Observable: read the cache EXACTLY the way the sender's recovery reads
+        // it. Recovery rebuilds the proof packet from the payload prove() emitted
+        // and looks up Transport.getCachedPacket(packet_hash) (python
+        // Resource.py:653-656 cache_request -> get_cached_packet). That only works
+        // because the proof's packet_hash is reproducible: the proof is HEADER_1
+        // and unencrypted, and outbound() never mutates packet.raw (it builds a
+        // copy for the wire / loopback delivers the same packet). So we rebuild the
+        // identical proof packet and ask getCachedPacket for its exact packetHash -
+        // the very key recovery uses. A conforming impl returns the cached packet
+        // (proof_in_cache True); one that omits the cache call returns null (False).
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val (sender, receiver) = buildResourceReceiver(link, 1200, forceSdu = 200)
+        val total = receiver.parts.size
+        if (total < 2) throw IllegalStateException("need a multi-part transfer, got $total")
+
+        // Rebuild the exact proof packet prove() built (same params, same payload)
+        // and run the recovery lookup on it: the same getCachedPacket(hash) the
+        // sender's AWAITING_PROOF path calls.
+        fun recoveryLookup(payload: ByteArray): Boolean {
+            val rebuilt = Packet.createRaw(
+                destinationHash = link.linkId,
+                data = payload,
+                packetType = PacketType.PROOF,
+                destinationType = DestinationType.LINK,
+                context = PacketContext.RESOURCE_PRF,
+                mtu = link.mtu,
+            )
+            return Transport.getCachedPacket(rebuilt.packetHash) != null
+        }
+
+        // Feed every part. In this port assemble() runs synchronously inside the
+        // last receivePart (Resource.receivePart -> assemble, same thread), so by
+        // the time the loop returns the transfer is fully concluded and, on a
+        // conforming impl, prove()'s cache write has committed. A single recovery
+        // lookup is therefore sufficient - no poll loop is needed (unlike the
+        // reference, where assemble runs in a separate thread).
+        for (i in 0 until total) receiver.receivePart(sender.parts[i]!!)
+        val payload = receiver.proofPayloadForTest()
+        val inCache = if (payload != null) recoveryLookup(payload) else false
+        val status = receiver.status
+        val complete = status == ResourceConstants.COMPLETE
+        // proof_link_ref: is the proof bound to THIS transfer's link (not merely to
+        // some link, and not to none)? prove() should set packet.link to the
+        // receiver's own link (python RNS.Packet(link, ...)); the Transport's
+        // LINK-packet interface filter (Transport.py:1031-1035) and in-process
+        // loopback both route the proof to that link's own interface via that
+        // reference. The unmodified kotlin prove() builds the proof via createRaw
+        // (link == null), so it reports false; the fix sets packet.link = link.
+        val proofLinkId = receiver.proofLinkIdForTest()
+        val proofLinkRef = proofLinkId != null && proofLinkId.contentEquals(link.linkId)
+        val out = result(
+            "total_parts" to intVal(total),
+            "status_name" to strVal(ResourceConstants.statusDescription(status)),
+            "complete" to boolVal(complete),
+            // proof_sent: prove() ran and built the proof payload (the positive
+            // control that a proof_in_cache False below means a missing cache
+            // call, not a transfer that never proved). Keyed on the payload -
+            // the same value the recovery lookup below is built from - rather
+            // than on send() success, which in the synthetic bridge is a
+            // link-routing detail unrelated to the cache (the property under
+            // test). Both impls build the payload when they reach prove().
+            "proof_sent" to boolVal(payload != null),
+            "proof_in_cache" to boolVal(inCache),
+            "proof_recovered" to boolVal(inCache),
+            // proof_link_ref: is the proof bound to THIS transfer's link (not to
+            // some other link, and not to none)? The Transport's LINK-packet
+            // interface filter (Transport.py:1031-1035) and in-process loopback
+            // route the proof to that link's own interface via the reference.
+            "proof_link_ref" to boolVal(proofLinkRef),
         )
         runCatching { receiver.cancel() }
         out

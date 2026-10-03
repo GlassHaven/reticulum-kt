@@ -1002,6 +1002,15 @@ object Transport {
      * Register a destination with transport.
      */
     fun registerDestination(destination: Destination) {
+        // Python Transport.py:2898: only IN-direction destinations are tracked
+        // here. OUT destinations (a peer we send to) are not local; registering
+        // them would make isLocalDestination treat the remote peer as local and
+        // skip its announces, and let findDestination return a remote OUT
+        // destination. The Destination auto-register call is already IN-guarded,
+        // but this is the single gate for every other caller.
+        if (destination.direction != DestinationDirection.IN) {
+            return
+        }
         // Prevent duplicate registration (matches Python Transport.py:2223-2225)
         val key = destination.hash.toKey()
         if (destinations.any { it.hash.toKey() == key }) {
