@@ -418,6 +418,15 @@ class Resource private constructor(
     // increments under concurrency. incrementAndGet() is atomic. (Kotlin-only
     // conformance instrumentation — no python equivalent.)
     private val proveCalls = AtomicInteger(0)
+    @Volatile private var lastProofPayload: ByteArray? = null
+    /** link_id of the link the last proof packet was bound to, or null if the
+     *  packet carried no link reference (packet.link == null). Python's
+     *  RNS.Packet(link, ...) always sets packet.destination = link; the kotlin
+     *  port builds the proof via Packet.createRaw which leaves packet.link null.
+     *  Recording the link_id (not a boolean) lets the bridge verify the proof is
+     *  bound to the transfer's actual link, not merely to some link.
+     *  Observation-only. */
+    @Volatile private var lastProofLinkId: ByteArray? = null
     @Volatile private var lastRequestData: ByteArray? = null
     private val requestNextEmitCount = AtomicInteger(0)
     private val hmuRequestsSent = AtomicInteger(0)
@@ -1298,6 +1307,12 @@ class Resource private constructor(
 
             val proof = Hashes.fullHash(proofData + hash)
             val proofPayload = hash + proof
+            // Observation-only: record the unencrypted proof payload (the value
+            // the packet carries and, when #97 lands, the value cached). Lets the
+            // conformance bridge assert the proof packet landed in the transport
+            // cache by its payload without reconstructing it. NOT the fix — the
+            // fix is the separate Transport.cache(...) call (python Resource.py:759).
+            lastProofPayload = proofPayload.copyOf()
 
             // Create proof packet - NOT encrypted (matches Python: resource proofs are not encrypted)
             val packet = Packet.createRaw(
@@ -1308,6 +1323,18 @@ class Resource private constructor(
                 context = PacketContext.RESOURCE_PRF,
                 mtu = link.mtu
             )
+
+            // Observation-only: which link (by link_id) is the proof bound to at
+            // send time, or null if the packet carries no link reference. Python's
+            // RNS.Packet(link, ...) always sets packet.destination = link, and the
+            // Transport's LINK-packet routing (interface filter at
+            // Transport.py:1031-1035 and the in-process loopback) reads that
+            // reference to send the proof only on the link's own interface. A
+            // packet built without the reference (createRaw leaves link == null)
+            // falls through to broadcast-on-all-interfaces (Transport.kt:3368).
+            // Recording the link_id (not a boolean) lets the bridge assert the proof
+            // is bound to the transfer's actual link, not merely to some link.
+            lastProofLinkId = packet.link?.linkId?.copyOf()
 
             packet.send()
             log("Sent proof for resource ${hash.toHexString()}")
@@ -2004,6 +2031,16 @@ class Resource private constructor(
 
     /** Instrumentation counters (see the fields for what each event is). */
     fun proveCallCountForTest(): Int = proveCalls.get()
+    /** The unencrypted proof payload the last prove() built (hash + proof).
+     *  Returns a defensive copy so callers cannot mutate the stored observation. */
+    fun proofPayloadForTest(): ByteArray? = lastProofPayload?.copyOf()
+    /** The link_id of the link the last prove()'s proof packet was bound to at
+     *  send time, or null if the packet carried no link reference (packet.link
+     *  == null). Python's RNS.Packet(link, ...) always sets the reference to the
+     *  transfer's link; the kotlin port's createRaw leaves it null. The bridge
+     *  compares this against the transfer's link_id so a proof bound to the wrong
+     *  (or no) link is both detected and named. Returns a defensive copy. */
+    fun proofLinkIdForTest(): ByteArray? = lastProofLinkId?.copyOf()
     fun lastRequestDataForTest(): ByteArray? = lastRequestData
     fun requestNextEmitCountForTest(): Int = requestNextEmitCount.get()
     fun hmuRequestsSentForTest(): Int = hmuRequestsSent.get()
