@@ -5540,6 +5540,15 @@ private fun handleWireCmd6(command: String, p: JsonObject): JsonObject? = when (
         val inCache = if (payload != null) recoveryLookup(payload) else false
         val status = receiver.status
         val complete = status == ResourceConstants.COMPLETE
+        // proof_link_ref: is the proof bound to THIS transfer's link (not merely to
+        // some link, and not to none)? prove() should set packet.link to the
+        // receiver's own link (python RNS.Packet(link, ...)); the Transport's
+        // LINK-packet interface filter (Transport.py:1031-1035) and in-process
+        // loopback both route the proof to that link's own interface via that
+        // reference. The unmodified kotlin prove() builds the proof via createRaw
+        // (link == null), so it reports false; the fix sets packet.link = link.
+        val proofLinkId = receiver.proofLinkIdForTest()
+        val proofLinkRef = proofLinkId != null && proofLinkId.contentEquals(link.linkId)
         val out = result(
             "total_parts" to intVal(total),
             "status_name" to strVal(ResourceConstants.statusDescription(status)),
@@ -5554,14 +5563,11 @@ private fun handleWireCmd6(command: String, p: JsonObject): JsonObject? = when (
             "proof_sent" to boolVal(payload != null),
             "proof_in_cache" to boolVal(inCache),
             "proof_recovered" to boolVal(inCache),
-            // proof_link_ref: did prove() set packet.link on the proof packet
-            // before calling send()? Python's RNS.Packet(link, ...) always does;
-            // the Transport's LINK-packet interface filter (Transport.py:1031-1035)
-            // and in-process loopback both depend on it. A packet built without
-            // the reference (createRaw leaves link == null) broadcasts on all
-            // interfaces in a multi-interface production setup and cannot use
-            // the same-process loopback optimization.
-            "proof_link_ref" to boolVal(receiver.proofLinkRefForTest()),
+            // proof_link_ref: is the proof bound to THIS transfer's link (not to
+            // some other link, and not to none)? The Transport's LINK-packet
+            // interface filter (Transport.py:1031-1035) and in-process loopback
+            // route the proof to that link's own interface via the reference.
+            "proof_link_ref" to boolVal(proofLinkRef),
         )
         runCatching { receiver.cancel() }
         out
