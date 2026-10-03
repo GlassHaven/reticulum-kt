@@ -1436,6 +1436,18 @@ class Resource private constructor(
                 mtu = link.mtu
             )
 
+            // Bind the proof to the transfer's link so the Transport routes it to
+            // that link's own interface. Python's RNS.Packet(link, ...) sets
+            // packet.destination = link (Packet.py:136), and the Transport's
+            // LINK-packet interface filter (Transport.py:1031-1035) plus
+            // in-process loopback read that reference to send the proof only on
+            // the link's own interface. Packet.createRaw leaves packet.link null,
+            // which falls through to broadcast-on-all-interfaces
+            // (Transport.kt:3368) in a multi-interface production setup. This
+            // matches the Link.kt idiom (packet.link = this) used by the port's
+            // other link-bound packet sends.
+            packet.link = link
+
             packet.send()
             // python Resource.py:759: cache the proof packet (force_cache=True)
             // so the sender's AWAITING_PROOF recovery (cache_request) can find
