@@ -5488,6 +5488,53 @@ private fun handleWireCmd6(command: String, p: JsonObject): JsonObject? = when (
         out
     }
 
+    "wire_resource_proof_cache_lookup" -> {
+        // Proof caching (receiver side, Resource.prove, python Resource.py:752-759).
+        // When a receiver completes a transfer it proves it (sends a single
+        // RESOURCE_PRF) AND force-caches the proof packet so the sender's
+        // AWAITING_PROOF recovery (cacheRequest, python Resource.py:653-656) can
+        // re-fetch a lost proof. reticulum-kt main's prove() sends but does NOT
+        // cache — the proof is "lost" even though generated (#65 / PR #97).
+        //
+        // Observable: the unencrypted proof packet's raw ends with the payload
+        // prove() built (hash + proof, via proofPayloadForTest). After assembly
+        // (synchronous inside receivePart), a conforming impl has cached a packet
+        // whose raw ends with that payload; an impl that omits the cache call has
+        // none. This is the same content the recovery's cacheRequest searches for
+        // and is robust to any header re-packing send()/outbound() apply.
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val (sender, receiver) = buildResourceReceiver(link, 1200, forceSdu = 200)
+        val total = receiver.parts.size
+        if (total < 2) throw IllegalStateException("need a multi-part transfer, got $total")
+        // Feed every part; the last triggers assemble() -> prove() synchronously.
+        for (i in 0 until total) receiver.receivePart(sender.parts[i]!!)
+        val status = receiver.status
+        val complete = status == ResourceConstants.COMPLETE
+        // Which cached packets' raw ends with the emitted proof payload.
+        val payload = receiver.proofPayloadForTest()
+        val matching = if (complete && payload != null) {
+            Transport.cachedPacketRawsForTest().count { raw ->
+                raw.size >= payload.size &&
+                    raw.copyOfRange(raw.size - payload.size, raw.size).contentEquals(payload)
+            }
+        } else {
+            0
+        }
+        val out = result(
+            "total_parts" to intVal(total),
+            "status_name" to strVal(ResourceConstants.statusDescription(status)),
+            "complete" to boolVal(complete),
+            "proof_sent" to boolVal(receiver.proveCallCountForTest() > 0),
+            "proof_in_cache" to boolVal(matching > 0),
+            "matching_cached" to intVal(matching),
+        )
+        runCatching { receiver.cancel() }
+        out
+    }
+
     "wire_resource_receiver_request_state" -> {
         val handle = p.str("handle")
         val linkIdHex = p.str("link_id")

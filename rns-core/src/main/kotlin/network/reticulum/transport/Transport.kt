@@ -2190,6 +2190,19 @@ object Transport {
     }
 
     /**
+     * Observation-only: the raw bytes of every cached packet.
+     *
+     * The conformance bridge uses this to check whether the receiver's proof
+     * packet (whose raw ends with the unencrypted `hash + proof` payload)
+     * landed in the cache — the entry the sender's AWAITING_PROOF recovery
+     * (cacheRequest) looks up (python Resource.py:653-656). Mirrors the python
+     * reference, which stores each cached packet's raw in a file the bridge can
+     * list. No mutation; returns copies.
+     */
+    fun cachedPacketRawsForTest(): List<ByteArray> =
+        packetCache.values.map { it.raw.copyOf() }
+
+    /**
      * Handle a cache request by re-injecting a cached packet.
      *
      * @param packetHash The requested packet hash

@@ -418,6 +418,7 @@ class Resource private constructor(
     // increments under concurrency. incrementAndGet() is atomic. (Kotlin-only
     // conformance instrumentation — no python equivalent.)
     private val proveCalls = AtomicInteger(0)
+    @Volatile private var lastProofPayload: ByteArray? = null
     @Volatile private var lastRequestData: ByteArray? = null
     private val requestNextEmitCount = AtomicInteger(0)
     private val hmuRequestsSent = AtomicInteger(0)
@@ -1298,6 +1299,12 @@ class Resource private constructor(
 
             val proof = Hashes.fullHash(proofData + hash)
             val proofPayload = hash + proof
+            // Observation-only: record the unencrypted proof payload (the value
+            // the packet carries and, when #97 lands, the value cached). Lets the
+            // conformance bridge assert the proof packet landed in the transport
+            // cache by its payload without reconstructing it. NOT the fix — the
+            // fix is the separate Transport.cache(...) call (python Resource.py:759).
+            lastProofPayload = proofPayload.copyOf()
 
             // Create proof packet - NOT encrypted (matches Python: resource proofs are not encrypted)
             val packet = Packet.createRaw(
@@ -2004,6 +2011,8 @@ class Resource private constructor(
 
     /** Instrumentation counters (see the fields for what each event is). */
     fun proveCallCountForTest(): Int = proveCalls.get()
+    /** The unencrypted proof payload the last prove() built (hash + proof). */
+    fun proofPayloadForTest(): ByteArray? = lastProofPayload
     fun lastRequestDataForTest(): ByteArray? = lastRequestData
     fun requestNextEmitCountForTest(): Int = requestNextEmitCount.get()
     fun hmuRequestsSentForTest(): Int = hmuRequestsSent.get()
