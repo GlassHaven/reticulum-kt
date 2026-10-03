@@ -2011,8 +2011,9 @@ class Resource private constructor(
 
     /** Instrumentation counters (see the fields for what each event is). */
     fun proveCallCountForTest(): Int = proveCalls.get()
-    /** The unencrypted proof payload the last prove() built (hash + proof). */
-    fun proofPayloadForTest(): ByteArray? = lastProofPayload
+    /** The unencrypted proof payload the last prove() built (hash + proof).
+     *  Returns a defensive copy so callers cannot mutate the stored observation. */
+    fun proofPayloadForTest(): ByteArray? = lastProofPayload?.copyOf()
     fun lastRequestDataForTest(): ByteArray? = lastRequestData
     fun requestNextEmitCountForTest(): Int = requestNextEmitCount.get()
     fun hmuRequestsSentForTest(): Int = hmuRequestsSent.get()
