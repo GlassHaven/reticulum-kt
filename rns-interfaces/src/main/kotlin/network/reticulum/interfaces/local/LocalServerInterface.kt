@@ -108,6 +108,17 @@ class LocalServerInterface : Interface {
     private val clients = CopyOnWriteArrayList<LocalClientInterface>()
 
     /**
+     * The actual TCP port the server is bound to.
+     *
+     * When constructed with [tcpPort] = 0 the OS assigns an ephemeral port and
+     * this property returns that real port (read back from the bound
+     * [ServerSocket]) once [start] has completed. Returns 0 for non-TCP
+     * transports (Unix / abstract sockets) or before [start] has bound.
+     */
+    val boundPort: Int
+        get() = serverSocket?.takeIf { it.isBound }?.localPort ?: 0
+
+    /**
      * Test seam: when non-null, [handleNewClient] invokes this hook in place of
      * [Transport.registerInterface] for the spawned client, so a test can
      * simulate the registration-failure path (the failure mode the try/catch in

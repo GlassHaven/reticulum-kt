@@ -116,7 +116,7 @@ private class WireInstance(
     val sharedClient: network.reticulum.interfaces.local.LocalClientInterface? = null,
     val sharedInstancePort: Int? = null,
     val destinations: MutableList<Pair<Identity, Destination>> = mutableListOf(),
-    // GROUP destinations keyed by hash hex — mirrors the python bridge's
+    // GROUP destinations keyed by hash hex - mirrors the python bridge's
     // inst["group_dests"] (wire_tcp.py cmd_wire_group_create). A GROUP
     // destination has no identity (symmetric key only), so it can't live in
     // `destinations` alongside the SINGLE ones; keep it in its own map.
@@ -134,7 +134,7 @@ private class WireInstance(
     // reference bridge's inst["out_resources"] (wire_tcp.py cmd_wire_resource_send /
     // cmd_wire_resource_cancel).
     val outResources: ConcurrentHashMap<String, Resource> = ConcurrentHashMap(),
-    // Initiator-side per-link channel state — mirrors the reference's
+    // Initiator-side per-link channel state - mirrors the reference's
     // inst["channels"] (_ensure_channel_state). Keyed by link_id hex.
     val channelStates: ConcurrentHashMap<String, ChannelState> = ConcurrentHashMap(),
 )
@@ -251,7 +251,7 @@ private const val WIRE_CHANNEL_MSGTYPE = 0x0101
 /** Fixed default stream id for Buffer streaming (reference _WIRE_BUFFER_STREAM_ID). */
 private const val WIRE_BUFFER_STREAM_ID = 0
 
-/** Bridge MessageBase carrying opaque bytes — mirrors the reference
+/** Bridge MessageBase carrying opaque bytes - mirrors the reference
  *  _WireChannelMessage (pack()=data, unpack stores raw). */
 private class WireChannelMessage(var data: ByteArray = ByteArray(0)) : MessageBase() {
     override val msgType = WIRE_CHANNEL_MSGTYPE
@@ -259,7 +259,7 @@ private class WireChannelMessage(var data: ByteArray = ByteArray(0)) : MessageBa
     override fun unpack(raw: ByteArray) { data = raw }
 }
 
-/** Bridge MessageBase with a caller-chosen msgType — mirrors the reference
+/** Bridge MessageBase with a caller-chosen msgType - mirrors the reference
  *  _AdHocChannelMessage (used by wire_channel_inject msgtype overrides). */
 private class AdHocMessage(override val msgType: Int, var data: ByteArray = ByteArray(0)) : MessageBase() {
     override fun pack(): ByteArray = data
@@ -413,7 +413,7 @@ private fun feedInboundLinkPacket(link: Link, plaintext: ByteArray, context: net
     link.receive(rx)
 }
 
-/** Lifecycle snapshot of an RNS.Link — mirrors the reference _link_status_dict.
+/** Lifecycle snapshot of an RNS.Link - mirrors the reference _link_status_dict.
  *  keepalive_s/stale_time_s/rtt cross the boundary in SECONDS (kotlin millis). */
 private fun linkStatusDict(link: Link): JsonObject {
     val now = System.currentTimeMillis()
@@ -470,7 +470,7 @@ private class Listener(
     // side that did NOT initiate the close.
     val inboundLinks: ConcurrentLinkedDeque<Link> = ConcurrentLinkedDeque(),
     // Receiver-side proof log: the raw context byte of every inbound packet
-    // this listener's links PROVED, in order — mirrors the reference's
+    // this listener's links PROVED, in order - mirrors the reference's
     // listener["proof_log"] populated by wrapping link.prove_packet
     // (wire_tcp.py:1299-1317). Filled by the Link.proveTapForTest tap installed
     // in wire_listen; drained by wire_listener_proof_log.
@@ -507,16 +507,20 @@ private class Listener(
 private const val WIRE_RX_MAX_DECOMPRESSED = 256 * 1024
 
 private val wireInstances = mutableMapOf<String, WireInstance>()
+// Per-handle cache: pristine raw frame built for `pristine_link_inbound`,
+// reused by `replay_reflag` so the replay tests the SAME wire bytes (a true
+// attacker capture) rather than a freshly-built packet. Keyed by link_id hex.
+private val wireReplayRawCache = ConcurrentHashMap<String, ByteArray>() // key: "$handle|$linkIdHex"
 
 /**
- * Request-handler invocation log, keyed "$handle|$destHex|$path" — mirrors the
+ * Request-handler invocation log, keyed "$handle|$destHex|$path" - mirrors the
  * reference bridge's _request_handler_log. The response generator appends one
  * JSON entry per request that reached the handler; wire_get_request_log drains
  * it. Cleared in resetWireState so it can't leak across tests sharing the JVM.
  */
 private val wireRequestHandlerLog = ConcurrentHashMap<String, MutableList<JsonObject>>()
 
-/** Last keepalive byte a link emitted/answered, keyed by link id hex — mirrors
+/** Last keepalive byte a link emitted/answered, keyed by link id hex - mirrors
  *  the reference's inst["keepalive_payloads"]. Cleared on reset. */
 private val wireKeepalivePayloads = ConcurrentHashMap<String, ByteArray>()
 
@@ -621,6 +625,7 @@ private fun allocateFreePort(): Int {
 private fun resetWireState() {
     val stale = wireInstances.values.toList()
     wireInstances.clear()
+    wireReplayRawCache.clear()
     wireRequestHandlerLog.clear()
     wireKeepalivePayloads.clear()
     runCatching { Transport.outboundTapForTest = null }
@@ -741,7 +746,7 @@ private fun parseStartConfig(p: JsonObject, defaultEnableTransport: Boolean): Pa
     return cfg to tuning
 }
 
-/** Fresh 8-byte hex receipt id token — mirrors the reference's
+/** Fresh 8-byte hex receipt id token - mirrors the reference's
  *  `secrets.token_hex(8)` keying inst["receipts"] (wire_tcp.py:3402). */
 private fun freshReceiptId(): String = defaultCryptoProvider().randomBytes(8).toHex()
 
@@ -1020,6 +1025,11 @@ private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (
                         Transport.registerInterface(iface.toRef())
                     }
                 }
+                Reticulum.setInterfaceDeregistrar { iface ->
+                    if (iface is network.reticulum.interfaces.Interface) {
+                        Transport.deregisterInterface(iface.toRef())
+                    }
+                }
 
                 rns = Reticulum.start(
                     configDir = configDir.absolutePath,
@@ -1235,6 +1245,69 @@ private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (
         result(*entries.toTypedArray())
     }
 
+    "wire_register_destination" -> {
+        // Probe the explicit destination-registration guard in isolation.
+        // Constructs a destination of the requested direction, clears it from
+        // the local-destination table (so construction-time auto-registration
+        // does not contaminate the result), performs ONE explicit register -
+        // the production send-path trigger (Reticulum.registerDestination ->
+        // Transport.registerDestination) - and reports whether the hash then
+        // lands in the local table. That membership drives the announce-skip
+        // gate (Transport.kt:3648 destinations.any / Transport.py:1710
+        // destinations_map). reticulum-kt #85: registerDestination is missing
+        // Python's IN-direction guard, so an OUT destination wrongly becomes
+        // "local" and its announces are skipped. IN is the positive control.
+        val handle = p.str("handle")
+        val direction = p.str("direction").uppercase()
+        val appName = p.str("app_name")
+        val aspectsJson = p.get("aspects")?.asJsonArray
+        val aspects: Array<String> = aspectsJson?.map { it.asString }?.toTypedArray() ?: emptyArray()
+
+        wireInstances[handle]
+            ?: throw IllegalArgumentException("Unknown handle: $handle")
+
+        val rnsDirection = when (direction) {
+            "IN" -> DestinationDirection.IN
+            "OUT" -> DestinationDirection.OUT
+            else -> throw IllegalArgumentException(
+                "direction must be IN or OUT, got: $direction"
+            )
+        }
+        val identity = Identity.create()
+        val destination = Destination.create(
+            identity = identity,
+            direction = rnsDirection,
+            type = DestinationType.SINGLE,
+            appName = appName,
+            aspects = aspects,
+        )
+
+        // Clear any construction-time registration so the explicit register
+        // below is the single unit under test (kotlin auto-registers IN only).
+        Transport.deregisterDestination(destination)
+
+        // The explicit register - the divergent unit. Python filters
+        // direction == IN (Transport.py:2898); the unguarded kotlin port
+        // (Transport.kt:1000) appends every direction.
+        Transport.registerDestination(destination)
+
+        val isLocal = Transport.findDestination(destination.hash) != null
+
+        // Tear down the probe: this command's whole job was to observe the
+        // register behavior in isolation, so the destination must not linger
+        // in the shared Transport table (a long-lived bridge accumulates one
+        // per call, and later commands read that same table). The hashes and
+        // is_local above were already captured, so removing it now is safe.
+        Transport.deregisterDestination(destination)
+
+        result(
+            "destination_hash" to hexVal(destination.hash),
+            "identity_hash" to hexVal(identity.hash),
+            "direction" to strVal(direction),
+            "is_local" to boolVal(isLocal),
+        )
+    }
+
     "wire_poll_path" -> {
         val handle = p.str("handle")
         val destHash = p.hex("destination_hash")
@@ -1400,7 +1473,7 @@ private fun handleWireCmd0(command: String, p: JsonObject): JsonObject? = when (
                     }
                 }
                 // RawChannelReader for the DEFAULT stream 0 PLUS any extra
-                // requested ids — mirrors the reference, which always registers
+                // requested ids - mirrors the reference, which always registers
                 // the default reader and then each buffer_stream_id.
                 val ids = (listOf(WIRE_BUFFER_STREAM_ID) + (bufferStreamIds ?: emptyList())).distinct()
                 for (sid in ids) {
@@ -3186,10 +3259,24 @@ private fun handleWireCmd3(command: String, p: JsonObject): JsonObject? = when (
         // link_id without checking destination_type re-delivers the replayed
         // payload (link-data replay).
         if (corruption == "pristine_link_inbound" || corruption == "replay_reflag") {
-            val inj = raw.copyOf()
+            val cacheKey = "$handle|$linkIdHex"
+            val cached = wireReplayRawCache[cacheKey]
+            // `reused_raw` reports whether THIS call injected the captured
+            // frame. Only replay_reflag consumes the cached frame; a repeated
+            // pristine_link_inbound always builds and injects a fresh one, so
+            // it must not be flagged as a reuse.
+            val reused = corruption == "replay_reflag" && cached != null
+            val inj = when {
+                reused -> cached!!.copyOf()
+                else -> raw.copyOf()
+            }
             if (corruption == "replay_reflag") {
                 inj[0] = ((inj[0].toInt() and 0b11111001) or (0b00000010 shl 2)).toByte() // dest-type -> PLAIN
                 inj[1] = 0.toByte()                                                       // hops -> 0
+            } else {
+                // pristine_link_inbound: cache the pristine raw for the
+                // subsequent replay_reflag call (same bytes = true replay).
+                wireReplayRawCache[cacheKey] = raw.copyOf()
             }
             val rx2 = Packet.unpack(inj)
             val unpacked2 = rx2 != null
@@ -3200,12 +3287,17 @@ private fun handleWireCmd3(command: String, p: JsonObject): JsonObject? = when (
             }
             Thread.sleep(50)
             val after2 = listener.recvBuffer.size
+            if (corruption == "replay_reflag") {
+                wireReplayRawCache.remove(cacheKey)
+            }
             return@handleWireCmd3 result(
                 "corruption" to strVal(corruption),
                 "unpacked" to boolVal(unpacked2),
                 "delivered" to boolVal(after2 > before),
                 "link_active" to boolVal(link.status == LinkConstants.ACTIVE),
                 "status_name" to (LINK_STATUS_NAMES[link.status]?.let { strVal(it) } ?: JsonNull.INSTANCE),
+                "reused_raw" to boolVal(reused),
+                "raw_hex" to strVal(inj.toHex()),
             )
         }
 
@@ -5396,6 +5488,91 @@ private fun handleWireCmd6(command: String, p: JsonObject): JsonObject? = when (
             "proofs_after_assembly" to intVal(receiver.proveCallCountForTest()),
             "status_name" to strVal(ResourceConstants.statusDescription(status)),
             "complete" to boolVal(status == ResourceConstants.COMPLETE),
+        )
+        runCatching { receiver.cancel() }
+        out
+    }
+
+    "wire_resource_proof_cache_lookup" -> {
+        // Proof caching (receiver side, Resource.prove, python Resource.py:752-759).
+        // When a receiver completes a transfer it proves it (sends a single
+        // RESOURCE_PRF) AND force-caches the proof packet so the sender's
+        // AWAITING_PROOF recovery (cacheRequest, python Resource.py:653-656) can
+        // re-fetch a lost proof. reticulum-kt main's prove() sends but does NOT
+        // cache - the proof is "lost" even though generated (#65 / PR #97).
+        //
+        // Observable: read the cache EXACTLY the way the sender's recovery reads
+        // it. Recovery rebuilds the proof packet from the payload prove() emitted
+        // and looks up Transport.getCachedPacket(packet_hash) (python
+        // Resource.py:653-656 cache_request -> get_cached_packet). That only works
+        // because the proof's packet_hash is reproducible: the proof is HEADER_1
+        // and unencrypted, and outbound() never mutates packet.raw (it builds a
+        // copy for the wire / loopback delivers the same packet). So we rebuild the
+        // identical proof packet and ask getCachedPacket for its exact packetHash -
+        // the very key recovery uses. A conforming impl returns the cached packet
+        // (proof_in_cache True); one that omits the cache call returns null (False).
+        val handle = p.str("handle")
+        val linkIdHex = p.str("link_id")
+        val inst = wireInstances[handle] ?: throw IllegalArgumentException("Unknown handle: $handle")
+        val link = inst.outLinks[linkIdHex] ?: throw IllegalArgumentException("Unknown link_id: $linkIdHex")
+        val (sender, receiver) = buildResourceReceiver(link, 1200, forceSdu = 200)
+        val total = receiver.parts.size
+        if (total < 2) throw IllegalStateException("need a multi-part transfer, got $total")
+
+        // Rebuild the exact proof packet prove() built (same params, same payload)
+        // and run the recovery lookup on it: the same getCachedPacket(hash) the
+        // sender's AWAITING_PROOF path calls.
+        fun recoveryLookup(payload: ByteArray): Boolean {
+            val rebuilt = Packet.createRaw(
+                destinationHash = link.linkId,
+                data = payload,
+                packetType = PacketType.PROOF,
+                destinationType = DestinationType.LINK,
+                context = PacketContext.RESOURCE_PRF,
+                mtu = link.mtu,
+            )
+            return Transport.getCachedPacket(rebuilt.packetHash) != null
+        }
+
+        // Feed every part. In this port assemble() runs synchronously inside the
+        // last receivePart (Resource.receivePart -> assemble, same thread), so by
+        // the time the loop returns the transfer is fully concluded and, on a
+        // conforming impl, prove()'s cache write has committed. A single recovery
+        // lookup is therefore sufficient - no poll loop is needed (unlike the
+        // reference, where assemble runs in a separate thread).
+        for (i in 0 until total) receiver.receivePart(sender.parts[i]!!)
+        val payload = receiver.proofPayloadForTest()
+        val inCache = if (payload != null) recoveryLookup(payload) else false
+        val status = receiver.status
+        val complete = status == ResourceConstants.COMPLETE
+        // proof_link_ref: is the proof bound to THIS transfer's link (not merely to
+        // some link, and not to none)? prove() should set packet.link to the
+        // receiver's own link (python RNS.Packet(link, ...)); the Transport's
+        // LINK-packet interface filter (Transport.py:1031-1035) and in-process
+        // loopback both route the proof to that link's own interface via that
+        // reference. The unmodified kotlin prove() builds the proof via createRaw
+        // (link == null), so it reports false; the fix sets packet.link = link.
+        val proofLinkId = receiver.proofLinkIdForTest()
+        val proofLinkRef = proofLinkId != null && proofLinkId.contentEquals(link.linkId)
+        val out = result(
+            "total_parts" to intVal(total),
+            "status_name" to strVal(ResourceConstants.statusDescription(status)),
+            "complete" to boolVal(complete),
+            // proof_sent: prove() ran and built the proof payload (the positive
+            // control that a proof_in_cache False below means a missing cache
+            // call, not a transfer that never proved). Keyed on the payload -
+            // the same value the recovery lookup below is built from - rather
+            // than on send() success, which in the synthetic bridge is a
+            // link-routing detail unrelated to the cache (the property under
+            // test). Both impls build the payload when they reach prove().
+            "proof_sent" to boolVal(payload != null),
+            "proof_in_cache" to boolVal(inCache),
+            "proof_recovered" to boolVal(inCache),
+            // proof_link_ref: is the proof bound to THIS transfer's link (not to
+            // some other link, and not to none)? The Transport's LINK-packet
+            // interface filter (Transport.py:1031-1035) and in-process loopback
+            // route the proof to that link's own interface via the reference.
+            "proof_link_ref" to boolVal(proofLinkRef),
         )
         runCatching { receiver.cancel() }
         out
