@@ -462,12 +462,20 @@ class LocalInterfaceTest {
             srv.clientCount(),
             "Server should have rolled back the spawned child after registration failure"
         )
-        // No stale entry in Transport (the hook threw, so registerInterface
-        // was never called; the catch must not have added one either).
-        assertEquals(
-            baselineClients,
-            Transport.localClientCount(),
-            "Transport.localClientInterfaces should be unchanged after registration failure"
+        // No NEW stale entry in Transport: the hook threw, so registerInterface
+        // was never called, and the catch must not have added one either. Assert
+        // `<= baseline` (not exact equality) because Transport is a JVM-global
+        // singleton shared across this test class: a sibling test's spawned child
+        // may be deregistering asynchronously (read loop -> clientDisconnected ->
+        // Transport.deregisterInterface on ioScope) and that late removal drops the
+        // global count below our baseline. A registration-failure leak would show
+        // as count > baseline, which this catches; a sibling's cleanup decrease is
+        // not a leak from this test.
+        assertTrue(
+            Transport.localClientCount() <= baselineClients,
+            "Transport.localClientInterfaces gained an entry after a failed " +
+                "registration (expected <= baseline=$baselineClients, " +
+                "got ${Transport.localClientCount()})"
         )
 
         srv.detach()
