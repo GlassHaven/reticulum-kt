@@ -382,17 +382,32 @@ class LocalInterfaceTest {
         server!!.start()
         val tcpPort = server!!.boundPort
 
+        // Each probe connects and closes immediately (the shape of a watchdog
+        // poll). Before closing, wait until the accept loop has spawned a child
+        // for this probe, so the spawn + register + teardown path is actually
+        // exercised: without this, the probes could all be unprocessed when the
+        // assertions below run (clientCount() would be 0 trivially) and the test
+        // would pass without testing anything.
         repeat(numProbes) {
-            Socket().use { probe ->
-                probe.connect(InetSocketAddress("127.0.0.1", tcpPort), 1000)
-                // Immediately close - mimics a watchdog probe.
+            val probe = Socket()
+            probe.connect(InetSocketAddress("127.0.0.1", tcpPort), 1000)
+            val seen = System.currentTimeMillis() + 3000
+            while (System.currentTimeMillis() < seen && server!!.clientCount() < 1) {
+                Thread.sleep(10)
             }
+            probe.close()
             Thread.sleep(20)
         }
 
-        // Poll until the server has reaped all transient spawned children.
+        // Poll until the server has reaped all transient spawned children and the
+        // Transport deregistrations have settled. Transport is a JVM-global
+        // singleton shared across this test class, so assert <= baseline (not
+        // exact equality): a leak shows as count > baseline; a sibling test's
+        // asynchronous cleanup can drop it below baseline without fault.
         val deadline = System.currentTimeMillis() + 3000
-        while (System.currentTimeMillis() < deadline && server!!.clientCount() > 0) {
+        while (System.currentTimeMillis() < deadline &&
+            (server!!.clientCount() > 0 || Transport.localClientCount() > baseline)
+        ) {
             Thread.sleep(50)
         }
 
@@ -401,10 +416,11 @@ class LocalInterfaceTest {
             server!!.clientCount(),
             "Server still reports live spawned children after probes closed; LocalClientInterface.readLoop / detach path did not run",
         )
-        assertEquals(
-            baseline,
-            Transport.localClientCount(),
-            "Transport.localClientInterfaces accumulated stale entries after $numProbes transient probe connects (expected baseline=$baseline)",
+        assertTrue(
+            Transport.localClientCount() <= baseline,
+            "Transport.localClientInterfaces gained an entry after $numProbes transient " +
+                "probe connects (expected <= baseline=$baseline, " +
+                "got ${Transport.localClientCount()})"
         )
     }
 
@@ -419,7 +435,6 @@ class LocalInterfaceTest {
      */
     @Test
     fun `registration failure rolls back the spawned child and closes the socket`() {
-        val baselineClients = Transport.localClientCount()
         val hookInvocations = AtomicInteger(0)
 
         val srv = LocalServerInterface(name = "RegFailServer", tcpPort = 0)
@@ -430,55 +445,89 @@ class LocalInterfaceTest {
         srv.start()
         val tcpPort = srv.boundPort
 
-        // Connect a socket; handleNewClient will add the child to clients,
-        // then invoke the hook (which throws), then the catch block rolls back.
         val probe = Socket()
-        probe.connect(InetSocketAddress("127.0.0.1", tcpPort), 1000)
-        probe.close()
+        try {
+            // Connect a socket; handleNewClient will add the child to clients,
+            // then invoke the hook (which throws), then the catch block rolls back.
+            // The probe is kept open: the test itself must NOT close it, so the
+            // server-side socket closure is observable (an EOF on our read).
+            probe.connect(InetSocketAddress("127.0.0.1", tcpPort), 1000)
+            probe.soTimeout = 3000 // bounds the EOF read below
 
-        // Wait for the accept loop to process the connection (the hook must
-        // run exactly once - proof the connection reached handleNewClient and
-        // the simulated registration-failure path was entered).
-        val deadline = System.currentTimeMillis() + 3000
-        while (System.currentTimeMillis() < deadline && hookInvocations.get() < 1) {
-            Thread.sleep(10)
+            // Wait for the accept loop to process the connection (the hook must
+            // run exactly once - proof the connection reached handleNewClient and
+            // the simulated registration-failure path was entered).
+            val deadline = System.currentTimeMillis() + 3000
+            while (System.currentTimeMillis() < deadline && hookInvocations.get() < 1) {
+                Thread.sleep(10)
+            }
+            assertEquals(
+                1,
+                hookInvocations.get(),
+                "The simulated registration hook was not invoked; the test cannot " +
+                    "confirm the registration-failure path ran"
+            )
+
+            // Wait for the catch block to roll the child back out of clients.
+            // The catch block runs socket.close() immediately after
+            // clients.remove, so once clientCount() is 0 the server's side is
+            // (or is about to be) closed.
+            val deadline2 = System.currentTimeMillis() + 3000
+            while (System.currentTimeMillis() < deadline2 && srv.clientCount() > 0) {
+                Thread.sleep(10)
+            }
+
+            // The spawned child was rolled back by the catch block.
+            assertEquals(
+                0,
+                srv.clientCount(),
+                "Server should have rolled back the spawned child after registration failure"
+            )
+
+            // The server closed ITS side of the socket. We never close the probe,
+            // so a read that returns EOF (-1) can only mean the server sent the
+            // FIN. The catch block does clients.remove() then socket.close(), so
+            // clientCount()==0 above does not guarantee the FIN has been sent yet -
+            // retry the read (short per-read timeout, generous deadline) until we
+            // get the EOF. If the catch block's socket.close() were removed, this
+            // loop would spin to the deadline and fail, never seeing an EOF.
+            probe.soTimeout = 200
+            var eof = -2
+            val eofDeadline = System.currentTimeMillis() + 5000
+            while (eof != -1 && System.currentTimeMillis() < eofDeadline) {
+                eof = try {
+                    probe.inputStream.read()
+                } catch (e: java.net.SocketTimeoutException) {
+                    -2
+                }
+                if (eof > 0) eof = -2 // ignore any stray bytes; keep waiting for the FIN
+            }
+            assertEquals(
+                -1,
+                eof,
+                "The server did not close its accepted socket after a failed " +
+                    "registration (no EOF within 5s). A probe that the test closes " +
+                    "itself cannot prove this; the FIN must come from the server."
+            )
+
+            // Note: this test deliberately does NOT assert on the global
+            // Transport.localClientInterfaces count. Transport is a JVM singleton
+            // shared across this whole test class, and a sibling test's spawned
+            // child registers into it asynchronously (on ioScope), so any
+            // baseline captured here races sibling registrations/deregistrations.
+            // The invariant this test cares about is also structurally guaranteed
+            // and already pinned deterministically: the hook throws before
+            // Transport.registerInterface is ever reached (line `if (registerHook
+            // != null) registerHook.invoke(...) else Transport.registerInterface`),
+            // so this test cannot add an entry, and the catch block's own-server
+            // rollback (clientCount() == 0 above) plus the socket EOF above are the
+            // observable invariants.
+        } finally {
+            // Always clean up: if any assertion above fails, the server (and its
+            // listener) must not be left running to hold a port for a sibling test.
+            runCatching { probe.close() }
+            srv.detach()
         }
-        assertEquals(
-            1,
-            hookInvocations.get(),
-            "The simulated registration hook was not invoked; the test cannot " +
-                "confirm the registration-failure path ran"
-        )
-
-        // Wait for the catch block to roll the child back out of clients.
-        val deadline2 = System.currentTimeMillis() + 3000
-        while (System.currentTimeMillis() < deadline2 && srv.clientCount() > 0) {
-            Thread.sleep(10)
-        }
-
-        // The spawned child was rolled back by the catch block.
-        assertEquals(
-            0,
-            srv.clientCount(),
-            "Server should have rolled back the spawned child after registration failure"
-        )
-        // No NEW stale entry in Transport: the hook threw, so registerInterface
-        // was never called, and the catch must not have added one either. Assert
-        // `<= baseline` (not exact equality) because Transport is a JVM-global
-        // singleton shared across this test class: a sibling test's spawned child
-        // may be deregistering asynchronously (read loop -> clientDisconnected ->
-        // Transport.deregisterInterface on ioScope) and that late removal drops the
-        // global count below our baseline. A registration-failure leak would show
-        // as count > baseline, which this catches; a sibling's cleanup decrease is
-        // not a leak from this test.
-        assertTrue(
-            Transport.localClientCount() <= baselineClients,
-            "Transport.localClientInterfaces gained an entry after a failed " +
-                "registration (expected <= baseline=$baselineClients, " +
-                "got ${Transport.localClientCount()})"
-        )
-
-        srv.detach()
     }
 
     @Test
