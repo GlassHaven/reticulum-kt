@@ -376,7 +376,6 @@ class LocalInterfaceTest {
     @Test
     fun `transient probe connections do not leak Transport localClientInterfaces entries`() {
         val numProbes = 10
-        val baseline = Transport.localClientCount()
 
         server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
@@ -387,28 +386,37 @@ class LocalInterfaceTest {
         // for this probe, so the spawn + register + teardown path is actually
         // exercised: without this, the probes could all be unprocessed when the
         // assertions below run (clientCount() would be 0 trivially) and the test
-        // would pass without testing anything.
+        // would pass without testing anything. try/finally so the probe socket is
+        // closed even if connect throws or the wait is interrupted.
         repeat(numProbes) {
             val probe = Socket()
-            probe.connect(InetSocketAddress("127.0.0.1", tcpPort), 1000)
-            val seen = System.currentTimeMillis() + 3000
-            while (System.currentTimeMillis() < seen && server!!.clientCount() < 1) {
-                Thread.sleep(10)
+            try {
+                probe.connect(InetSocketAddress("127.0.0.1", tcpPort), 1000)
+                val seen = System.currentTimeMillis() + 3000
+                while (System.currentTimeMillis() < seen && server!!.clientCount() < 1) {
+                    Thread.sleep(10)
+                }
+            } finally {
+                probe.close()
             }
-            probe.close()
             Thread.sleep(20)
         }
 
-        // Poll until the server has reaped all transient spawned children and the
-        // Transport deregistrations have settled. Transport is a JVM-global
-        // singleton shared across this test class, so assert <= baseline (not
-        // exact equality): a leak shows as count > baseline; a sibling test's
-        // asynchronous cleanup can drop it below baseline without fault.
-        val deadline = System.currentTimeMillis() + 3000
+        // Poll until every child this server spawned has completed its full
+        // teardown. clientDisconnected() does, in order: clients.remove() ->
+        // Transport.deregisterInterface() -> liveClientInterfaces.remove(child),
+        // so an empty liveClientInterfaces queue deterministically means all
+        // children are gone from BOTH the server bookkeeping AND
+        // Transport.localClientInterfaces. We do NOT rely on the global
+        // Transport count or the per-ref hash check: the hash is derived from
+        // toString(), and with ephemeral ports (tcpPort=0) two servers' first
+        // children share the name "1@0" and therefore collide - a sibling test's
+        // leftover entry would be falsely attributed to this server.
+        val deadline = System.currentTimeMillis() + 5000
         while (System.currentTimeMillis() < deadline &&
-            (server!!.clientCount() > 0 || Transport.localClientCount() > baseline)
+            !server!!.liveClientInterfaces.isEmpty()
         ) {
-            Thread.sleep(50)
+            Thread.sleep(25)
         }
 
         assertEquals(
@@ -417,10 +425,11 @@ class LocalInterfaceTest {
             "Server still reports live spawned children after probes closed; LocalClientInterface.readLoop / detach path did not run",
         )
         assertTrue(
-            Transport.localClientCount() <= baseline,
-            "Transport.localClientInterfaces gained an entry after $numProbes transient " +
-                "probe connects (expected <= baseline=$baseline, " +
-                "got ${Transport.localClientCount()})"
+            server!!.liveClientInterfaces.isEmpty(),
+            "This server left ${server!!.liveClientInterfaces.size} spawned child(ren) " +
+                "un-removed after its $numProbes probe connections disconnected " +
+                "(expected 0) - a child did not complete teardown() and its " +
+                "Transport.localClientInterfaces entry was not deregistered"
         )
     }
 

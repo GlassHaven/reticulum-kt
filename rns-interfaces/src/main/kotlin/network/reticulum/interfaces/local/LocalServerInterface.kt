@@ -126,6 +126,19 @@ class LocalServerInterface : Interface {
      */
     internal var registerInterfaceForTest: ((InterfaceRef) -> Unit)? = null
 
+    /**
+     * Test seam: the spawned children of THIS server that are currently live,
+     * tracked by interface identity (not by the Transport hash, which is
+     * toString()-derived and not unique across servers - see the probe-leak
+     * regression test). Added on successful register, removed in
+     * [clientDisconnected] (which runs synchronously right after the child's
+     * Transport deregistration), so an empty set deterministically means every
+     * child this server spawned has completed its full teardown
+     * (clients.remove + Transport.deregisterInterface), immune to sibling tests'
+     * concurrent register/deregister.
+     */
+    internal val liveClientInterfaces = java.util.concurrent.ConcurrentLinkedQueue<LocalClientInterface>()
+
     override val bitrate: Int = BITRATE
     override val hwMtu: Int = HW_MTU
     override val supportsLinkMtuDiscovery: Boolean = true
@@ -374,15 +387,17 @@ class LocalServerInterface : Interface {
         // adds if registration fails.
         val registered = try {
             // Test seam: when set, the hook replaces the Transport registration
-            // call so a test can simulate a registration failure (the failure
-            // mode the try/catch below was added to contain). Null in
+            // call so a test can simulate a registration failure (the failure mode
+            // the try/catch below was added to contain). Null in
             // production - the real registerInterface runs.
             val registerHook = registerInterfaceForTest
+            val childRef = clientInterface.toRef()
             if (registerHook != null) {
-                registerHook.invoke(clientInterface.toRef())
+                registerHook.invoke(childRef)
             } else {
-                Transport.registerInterface(clientInterface.toRef())
+                Transport.registerInterface(childRef)
             }
+            liveClientInterfaces.add(clientInterface)
             true
         } catch (e: Exception) {
             log("Could not register spawned interface with Transport: ${e.message}")
@@ -416,10 +431,21 @@ class LocalServerInterface : Interface {
     internal fun clientDisconnected(client: LocalClientInterface) {
         clients.remove(client)
         spawnedInterfaces?.remove(client)
+        var deregistered = true
         try {
             Transport.deregisterInterface(client.toRef())
         } catch (e: Exception) {
+            deregistered = false
             log("Could not deregister spawned interface from Transport: ${e.message}")
+        }
+        // Only clear the live-set entry when the Transport deregistration actually
+        // succeeded, so an empty queue deterministically means this child's entry
+        // is gone from Transport.localClientInterfaces (and a deregistration that
+        // threw - a real leak - leaves it behind and the probe-leak test catches
+        // it). This tracks the child by identity, immune to the sibling tests'
+        // concurrent register/deregister that a shared count/hash would race.
+        if (deregistered) {
+            liveClientInterfaces.remove(client)
         }
 
         log("Client disconnected: ${client.name} (remaining: ${clients.size})")
