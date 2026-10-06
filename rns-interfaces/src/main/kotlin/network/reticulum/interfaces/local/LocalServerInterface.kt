@@ -380,30 +380,79 @@ class LocalServerInterface : Interface {
         // tests that wait on clientCount() sound: once N is observed, all N
         // children are already registered, so a later teardown cannot deregister
         // one before its registration completes and leak a stale Transport
-        // entry. The kotlin port wraps registerInterface in try/catch (a
-        // pre-existing deviation from python - python lets the exception
-        // propagate and therefore never reaches read_loop); on failure the child
-        // was never added to the bookkeeping, so rollback is just the socket.
-        val registered = try {
-            // Test seam: when set, the hook replaces the Transport registration
-            // call so a test can simulate a registration failure (the failure mode
-            // the try/catch below was added to contain). Null in
-            // production - the real registerInterface runs.
-            val registerHook = registerInterfaceForTest
-            val childRef = clientInterface.toRef()
+        // entry.
+        //
+        // The whole {register, add, start} sequence runs under the same lock
+        // detach() holds while it tears children down (synchronized(clients)).
+        // detach() sets detached=true (via super.detach()) BEFORE it takes the
+        // lock, so checking it inside the lock here is a reliable "is shutdown
+        // in flight" test:
+        //   - detached false on entry: detach cannot have run its iteration yet
+        //     (it only sets the flag, not yet under the lock), so after we add
+        //     the child its iteration will see and tear it down.
+        //   - detached true on entry: detach is at or past its iteration, so we
+        //     roll back (deregister + remove + close) ourselves. A no-op if
+        //     detach already cleared it; a safe cleanup if it hasn't reached us.
+        // The register-failure path (below) needs no lock: on failure the child
+        // was never added to the bookkeeping, so nothing to coordinate.
+        val registerHook = registerInterfaceForTest
+        val childRef = clientInterface.toRef()
+        try {
             if (registerHook != null) {
                 registerHook.invoke(childRef)
             } else {
                 Transport.registerInterface(childRef)
             }
             liveClientInterfaces.add(clientInterface)
-            clients.add(clientInterface)
-            spawnedInterfaces?.add(clientInterface)
-            true
+            synchronized(clients) {
+                // Server shut down after we registered but before we added the
+                // child to clients: detach() cannot reliably tear it down, so
+                // roll it back here. (start() is non-blocking - it only launches
+                // the read loop on ioScope - so holding this lock across it is
+                // safe.)
+                if (detached.get()) {
+                    try {
+                        Transport.deregisterInterface(childRef)
+                    } catch (deregEx: Exception) {
+                        log("Could not deregister child after shutdown: ${deregEx.message}")
+                    }
+                    liveClientInterfaces.remove(clientInterface)
+                    try {
+                        socket.close()
+                    } catch (closeEx: Exception) {
+                        log("Could not close socket after shutdown: ${closeEx.message}")
+                    }
+                    return
+                }
+                clients.add(clientInterface)
+                spawnedInterfaces?.add(clientInterface)
+                try {
+                    // start() launches the read loop on ioScope. If it throws,
+                    // the child is already registered and in the bookkeeping, so
+                    // roll both back (mirroring python's teardown-on-failure) and
+                    // close the socket.
+                    clientInterface.start()
+                } catch (e: Exception) {
+                    log("Could not start spawned client read loop: ${e.message}")
+                    try {
+                        Transport.deregisterInterface(childRef)
+                    } catch (deregEx: Exception) {
+                        log("Could not deregister rolled-back client: ${deregEx.message}")
+                    }
+                    liveClientInterfaces.remove(clientInterface)
+                    clients.remove(clientInterface)
+                    spawnedInterfaces?.remove(clientInterface)
+                    try {
+                        socket.close()
+                    } catch (closeEx: Exception) {
+                        log("Could not close socket after start failure: ${closeEx.message}")
+                    }
+                }
+            }
         } catch (e: Exception) {
             log("Could not register spawned interface with Transport: ${e.message}")
             // The child was never added to clients / spawnedInterfaces (the adds
-            // below only run on success), so there is no bookkeeping to roll
+            // above only run on success), so there is no bookkeeping to roll
             // back. Without start(), no read loop runs and detach() is never
             // reached, so the accepted socket would stay open until GC. Python's
             // socketserver framework closes the socket when the handler thread
@@ -416,32 +465,7 @@ class LocalServerInterface : Interface {
             } catch (closeEx: Exception) {
                 log("Could not close socket after registration failure: ${closeEx.message}")
             }
-            false
-        }
-
-        if (registered) {
-            // start() launches the read loop on ioScope. If it throws, the
-            // child is already registered with Transport and present in the
-            // bookkeeping, so roll both back (mirroring python's
-            // teardown-on-failure) and close the socket.
-            try {
-                clientInterface.start()
-            } catch (e: Exception) {
-                log("Could not start spawned client read loop: ${e.message}")
-                try {
-                    Transport.deregisterInterface(clientInterface.toRef())
-                } catch (deregEx: Exception) {
-                    log("Could not deregister rolled-back client: ${deregEx.message}")
-                }
-                liveClientInterfaces.remove(clientInterface)
-                clients.remove(clientInterface)
-                spawnedInterfaces?.remove(clientInterface)
-                try {
-                    socket.close()
-                } catch (closeEx: Exception) {
-                    log("Could not close socket after start failure: ${closeEx.message}")
-                }
-            }
+            return
         }
 
         log("Client connected: $clientName (total: ${clients.size})")
@@ -510,18 +534,29 @@ class LocalServerInterface : Interface {
         acceptJob?.cancel()
         ioScope.cancel()
 
-        // Disconnect all clients using a Java snapshot copy. Kotlin's toList()
-        // has a fast path for size==1 that can race with concurrent removals on
-        // CopyOnWriteArrayList during shutdown.
-        for (client in ArrayList(clients)) {
-            try {
-                Transport.deregisterInterface(client.toRef())
-            } catch (e: Exception) {
-                // Ignore during shutdown
+        // Tear down clients under the same lock handleNewClient() holds across
+        // its {add, start} (synchronized(clients)). super.detach() above has
+        // already set detached=true, so a handleNewClient that takes the lock
+        // first sees the child it is adding and is torn down here, while one
+        // that arrives after our clear observes detached=true and rolls back.
+        // Without this lock the two could interleave so a registered child is
+        // neither in the iteration snapshot (added after we copied) nor seen by
+        // the post-clear detached check, leaking its Transport entry + socket.
+        //
+        // A Java snapshot copy is used: Kotlin's toList() has a fast path for
+        // size==1 that can race with concurrent removals on CopyOnWriteArrayList
+        // during shutdown.
+        synchronized(clients) {
+            for (client in ArrayList(clients)) {
+                try {
+                    Transport.deregisterInterface(client.toRef())
+                } catch (e: Exception) {
+                    // Ignore during shutdown
+                }
+                client.detach()
             }
-            client.detach()
+            clients.clear()
         }
-        clients.clear()
 
         // Close server socket
         try {
