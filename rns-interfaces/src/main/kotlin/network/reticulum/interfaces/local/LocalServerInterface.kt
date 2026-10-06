@@ -362,9 +362,6 @@ class LocalServerInterface : Interface {
             parentServer = this
         )
 
-        clients.add(clientInterface)
-        spawnedInterfaces?.add(clientInterface)
-
         clientInterface.onPacketReceived = { data, iface ->
             // Forward received packets to our callback
             onPacketReceived?.invoke(data, iface)
@@ -377,14 +374,16 @@ class LocalServerInterface : Interface {
         // otherwise race detach() ahead of registerInterface() and leak the
         // entry into Transport.localClientInterfaces forever.
         //
-        // The kotlin port wraps registerInterface in try/catch (a pre-existing
-        // deviation from python — python lets the exception propagate and
-        // therefore never reaches read_loop). To keep the failure-path
-        // behavior consistent with python's invariants (read loop only runs
-        // for a Transport-registered interface; bookkeeping collections only
-        // hold registered interfaces), we gate `start()` on successful
-        // registration and roll back the prior `clients` / `spawnedInterfaces`
-        // adds if registration fails.
+        // The child is added to `clients` / `spawnedInterfaces` ONLY after
+        // registration succeeds, so clientCount() (and spawnedInterfaces)
+        // reflect registered children exclusively. That invariant is what makes
+        // tests that wait on clientCount() sound: once N is observed, all N
+        // children are already registered, so a later teardown cannot deregister
+        // one before its registration completes and leak a stale Transport
+        // entry. The kotlin port wraps registerInterface in try/catch (a
+        // pre-existing deviation from python - python lets the exception
+        // propagate and therefore never reaches read_loop); on failure the child
+        // was never added to the bookkeeping, so rollback is just the socket.
         val registered = try {
             // Test seam: when set, the hook replaces the Transport registration
             // call so a test can simulate a registration failure (the failure mode
@@ -398,13 +397,15 @@ class LocalServerInterface : Interface {
                 Transport.registerInterface(childRef)
             }
             liveClientInterfaces.add(clientInterface)
+            clients.add(clientInterface)
+            spawnedInterfaces?.add(clientInterface)
             true
         } catch (e: Exception) {
             log("Could not register spawned interface with Transport: ${e.message}")
-            clients.remove(clientInterface)
-            spawnedInterfaces?.remove(clientInterface)
-            // Without start(), no read loop runs and detach() is never reached,
-            // so the accepted socket would stay open until GC. Python's
+            // The child was never added to clients / spawnedInterfaces (the adds
+            // below only run on success), so there is no bookkeeping to roll
+            // back. Without start(), no read loop runs and detach() is never
+            // reached, so the accepted socket would stay open until GC. Python's
             // socketserver framework closes the socket when the handler thread
             // unwinds from an exception (LocalInterface.py:501-507 wraps the
             // append+read_loop sequence in BaseRequestHandler.handle, which
@@ -419,7 +420,28 @@ class LocalServerInterface : Interface {
         }
 
         if (registered) {
-            clientInterface.start()
+            // start() launches the read loop on ioScope. If it throws, the
+            // child is already registered with Transport and present in the
+            // bookkeeping, so roll both back (mirroring python's
+            // teardown-on-failure) and close the socket.
+            try {
+                clientInterface.start()
+            } catch (e: Exception) {
+                log("Could not start spawned client read loop: ${e.message}")
+                try {
+                    Transport.deregisterInterface(clientInterface.toRef())
+                } catch (deregEx: Exception) {
+                    log("Could not deregister rolled-back client: ${deregEx.message}")
+                }
+                liveClientInterfaces.remove(clientInterface)
+                clients.remove(clientInterface)
+                spawnedInterfaces?.remove(clientInterface)
+                try {
+                    socket.close()
+                } catch (closeEx: Exception) {
+                    log("Could not close socket after start failure: ${closeEx.message}")
+                }
+            }
         }
 
         log("Client connected: $clientName (total: ${clients.size})")
