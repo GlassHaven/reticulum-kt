@@ -1,5 +1,6 @@
 package network.reticulum.interfaces.local
 
+import network.reticulum.transport.Transport
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
@@ -283,7 +284,7 @@ class LocalInterfaceTest {
     /**
      * Stress regression for the spawned-child read loop. On Android, real-world
      * Carina-as-shared-instance soak (>30 min uptime) has been observed to wedge
-     * a long-lived spawned child's read loop — inbound bytes stop draining even
+     * a long-lived spawned child's read loop - inbound bytes stop draining even
      * though the socket remains ESTABLISHED and outbound bytes still flow. The
      * suspected interaction was a redundant `withContext(Dispatchers.IO)` inside
      * the read loop (already running on `ioScope`'s IO dispatcher), which this
@@ -291,7 +292,7 @@ class LocalInterfaceTest {
      * pattern at `RNS/Interfaces/LocalInterface.py:302`.
      *
      * The wedge is not deterministically reproducible on a desktop JVM, so this
-     * test does not assert "wedge is fixed" — it asserts "long-lived spawned
+     * test does not assert "wedge is fixed" - it asserts "long-lived spawned
      * child keeps draining inbound bytes under aggressive sibling probe churn",
      * which is the regression guard for any future change that disturbs the
      * read loop body.
@@ -357,6 +358,185 @@ class LocalInterfaceTest {
             "Long-lived client sent $numRounds packets, server received ${receivedCount.get()}. " +
                 "Read loop may have wedged under sibling churn.",
         )
+    }
+
+    /**
+     * Regression: transient probe-style connections (open + immediate close,
+     * the shape that `Reticulum.isSharedInstanceRunning(port)` produces on
+     * every shared-instance auto-recovery poll) should not leave stale entries
+     * in `Transport.localClientInterfaces`. Python's `LocalInterface.teardown()`
+     * at `RNS/Interfaces/LocalInterface.py:353-354` removes the spawned interface
+     * from `Transport.local_client_interfaces` via `in` + `remove` - identity
+     * equality on the same `spawned_interface` object that was appended at
+     * `LocalInterface.py:462`. The kotlin port relies on the same identity
+     * invariant via the `InterfaceAdapter.getOrCreate` cache; this test fails
+     * loudly if that invariant ever breaks (e.g. via the read-loop / register
+     * ordering race fixed in this commit).
+     */
+    @Test
+    fun `transient probe connections do not leak Transport localClientInterfaces entries`() {
+        val numProbes = 10
+
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
+        server!!.start()
+        val tcpPort = server!!.boundPort
+
+        // Each probe connects and closes immediately (the shape of a watchdog
+        // poll). Before closing, wait until the accept loop has spawned a child
+        // for this probe, so the spawn + register + teardown path is actually
+        // exercised: without this, the probes could all be unprocessed when the
+        // assertions below run (clientCount() would be 0 trivially) and the test
+        // would pass without testing anything. try/finally so the probe socket is
+        // closed even if connect throws or the wait is interrupted.
+        repeat(numProbes) {
+            val probe = Socket()
+            try {
+                probe.connect(InetSocketAddress("127.0.0.1", tcpPort), 1000)
+                val seen = System.currentTimeMillis() + 3000
+                while (System.currentTimeMillis() < seen && server!!.clientCount() < 1) {
+                    Thread.sleep(10)
+                }
+            } finally {
+                probe.close()
+            }
+            Thread.sleep(20)
+        }
+
+        // Poll until every child this server spawned has completed its full
+        // teardown. clientDisconnected() does, in order: clients.remove() ->
+        // Transport.deregisterInterface() -> liveClientInterfaces.remove(child),
+        // so an empty liveClientInterfaces queue deterministically means all
+        // children are gone from BOTH the server bookkeeping AND
+        // Transport.localClientInterfaces. We do NOT rely on the global
+        // Transport count or the per-ref hash check: the hash is derived from
+        // toString(), and with ephemeral ports (tcpPort=0) two servers' first
+        // children share the name "1@0" and therefore collide - a sibling test's
+        // leftover entry would be falsely attributed to this server.
+        val deadline = System.currentTimeMillis() + 5000
+        while (System.currentTimeMillis() < deadline &&
+            !server!!.liveClientInterfaces.isEmpty()
+        ) {
+            Thread.sleep(25)
+        }
+
+        assertEquals(
+            0,
+            server!!.clientCount(),
+            "Server still reports live spawned children after probes closed; LocalClientInterface.readLoop / detach path did not run",
+        )
+        assertTrue(
+            server!!.liveClientInterfaces.isEmpty(),
+            "This server left ${server!!.liveClientInterfaces.size} spawned child(ren) " +
+                "un-removed after its $numProbes probe connections disconnected " +
+                "(expected 0) - a child did not complete teardown() and its " +
+                "Transport.localClientInterfaces entry was not deregistered"
+        )
+    }
+
+    /**
+     * Registration failure regression: when Transport.registerInterface throws
+     * (the JVM/coroutine pragmatic that motivated the try/catch in
+     * handleNewClient), the spawned child must be rolled back cleanly:
+     * removed from clients and spawnedInterfaces, the socket closed, and the
+     * read loop never started. Exercises the catch block that is otherwise
+     * unreachable in normal operation (registerInterface realistically never
+     * throws).
+     */
+    @Test
+    fun `registration failure rolls back the spawned child and closes the socket`() {
+        val hookInvocations = AtomicInteger(0)
+
+        val srv = LocalServerInterface(name = "RegFailServer", tcpPort = 0)
+        srv.registerInterfaceForTest = { _ ->
+            hookInvocations.incrementAndGet()
+            throw IllegalStateException("simulated registration failure")
+        }
+        srv.start()
+        val tcpPort = srv.boundPort
+
+        val probe = Socket()
+        try {
+            // Connect a socket; handleNewClient will add the child to clients,
+            // then invoke the hook (which throws), then the catch block rolls back.
+            // The probe is kept open: the test itself must NOT close it, so the
+            // server-side socket closure is observable (an EOF on our read).
+            probe.connect(InetSocketAddress("127.0.0.1", tcpPort), 1000)
+            probe.soTimeout = 3000 // bounds the EOF read below
+
+            // Wait for the accept loop to process the connection (the hook must
+            // run exactly once - proof the connection reached handleNewClient and
+            // the simulated registration-failure path was entered).
+            val deadline = System.currentTimeMillis() + 3000
+            while (System.currentTimeMillis() < deadline && hookInvocations.get() < 1) {
+                Thread.sleep(10)
+            }
+            assertEquals(
+                1,
+                hookInvocations.get(),
+                "The simulated registration hook was not invoked; the test cannot " +
+                    "confirm the registration-failure path ran"
+            )
+
+            // Wait for the catch block to roll the child back out of clients.
+            // The catch block runs socket.close() immediately after
+            // clients.remove, so once clientCount() is 0 the server's side is
+            // (or is about to be) closed.
+            val deadline2 = System.currentTimeMillis() + 3000
+            while (System.currentTimeMillis() < deadline2 && srv.clientCount() > 0) {
+                Thread.sleep(10)
+            }
+
+            // The spawned child was rolled back by the catch block.
+            assertEquals(
+                0,
+                srv.clientCount(),
+                "Server should have rolled back the spawned child after registration failure"
+            )
+
+            // The server closed ITS side of the socket. We never close the probe,
+            // so a read that returns EOF (-1) can only mean the server sent the
+            // FIN. The catch block does clients.remove() then socket.close(), so
+            // clientCount()==0 above does not guarantee the FIN has been sent yet -
+            // retry the read (short per-read timeout, generous deadline) until we
+            // get the EOF. If the catch block's socket.close() were removed, this
+            // loop would spin to the deadline and fail, never seeing an EOF.
+            probe.soTimeout = 200
+            var eof = -2
+            val eofDeadline = System.currentTimeMillis() + 5000
+            while (eof != -1 && System.currentTimeMillis() < eofDeadline) {
+                eof = try {
+                    probe.inputStream.read()
+                } catch (e: java.net.SocketTimeoutException) {
+                    -2
+                }
+                if (eof > 0) eof = -2 // ignore any stray bytes; keep waiting for the FIN
+            }
+            assertEquals(
+                -1,
+                eof,
+                "The server did not close its accepted socket after a failed " +
+                    "registration (no EOF within 5s). A probe that the test closes " +
+                    "itself cannot prove this; the FIN must come from the server."
+            )
+
+            // Note: this test deliberately does NOT assert on the global
+            // Transport.localClientInterfaces count. Transport is a JVM singleton
+            // shared across this whole test class, and a sibling test's spawned
+            // child registers into it asynchronously (on ioScope), so any
+            // baseline captured here races sibling registrations/deregistrations.
+            // The invariant this test cares about is also structurally guaranteed
+            // and already pinned deterministically: the hook throws before
+            // Transport.registerInterface is ever reached (line `if (registerHook
+            // != null) registerHook.invoke(...) else Transport.registerInterface`),
+            // so this test cannot add an entry, and the catch block's own-server
+            // rollback (clientCount() == 0 above) plus the socket EOF above are the
+            // observable invariants.
+        } finally {
+            // Always clean up: if any assertion above fails, the server (and its
+            // listener) must not be left running to hold a port for a sibling test.
+            runCatching { probe.close() }
+            srv.detach()
+        }
     }
 
     @Test
