@@ -22,6 +22,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import network.reticulum.Reticulum
+import network.reticulum.android.lifecycle.StoreLifecycle
 import network.reticulum.interfaces.local.LocalServerInterface
 import java.io.File
 
@@ -66,6 +67,13 @@ class ReticulumService : LifecycleService() {
     // Room database for persistent storage
     private var database: network.reticulum.android.db.ReticulumDatabase? = null
     private var dbWriteExecutor: java.util.concurrent.ExecutorService? = null
+
+    // The RoomIdentityStore instance backing Identity.identityStore. Kept as a
+    // concrete reference so its instance-owned durable-write state can be
+    // released ([dispose]) during teardown after the write executor is drained
+    // and before/with the database close — otherwise the retired store's
+    // executor, DAO-capturing lambdas, and RoomDatabase would stay retained.
+    private var identityStore: network.reticulum.android.db.store.RoomIdentityStore? = null
 
     // Pause/resume state tracking
     private var _isPaused = false
@@ -253,22 +261,51 @@ class ReticulumService : LifecycleService() {
         serviceScope.cancel()
         shutdownReticulum()
 
-        // Shut down Room write executor and close database
-        dbWriteExecutor?.let { executor ->
-            executor.shutdown()
-            try {
-                executor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)
-            } catch (_: InterruptedException) { }
-        }
-        dbWriteExecutor = null
-
-        // Null out store references before closing DB to prevent use-after-close
+        // Null out store references BEFORE draining + closing — once nulled,
+        // no new RoomPathStore/RoomPacketHashStore/etc. saveAll(...) calls
+        // can post fresh work onto the executor. We then drain whatever's
+        // already queued before closing the database.
         network.reticulum.transport.Transport.pathStore = null
         network.reticulum.transport.Transport.packetHashStore = null
         network.reticulum.transport.Transport.tunnelStore = null
         network.reticulum.transport.Transport.announceStore = null
         network.reticulum.transport.Transport.discoveryStore = null
+        network.reticulum.transport.Transport.destinationRatchetStore = null
         network.reticulum.identity.Identity.identityStore = null
+
+        // Drain the Room write executor BEFORE closing the database. If
+        // we close while a queued task is still pending, the task hits
+        // a closed connection pool and throws IllegalStateException
+        // ("Cannot perform this operation because the connection pool
+        // has been closed" or "attempt to re-open an already-closed
+        // object: SQLiteDatabase"). See StoreLifecycle for the full
+        // rationale and the Sentry references (COLUMBA-8R, COLUMBA-8X).
+        //
+        // Timeouts: onDestroy runs on the Android main thread; the
+        // Service ANR window for foreground service teardown is ~20s.
+        // StoreLifecycle's defaults of 15s + 5s sit right at that
+        // cliff. Cap the drain budget at 4s + 1s = 5s total so we
+        // stay comfortably under the ANR threshold even on a slow
+        // device. Any writes that don't drain in 4s get shutdownNow'd
+        // and may be lost — acceptable trade vs. ANRing the user out.
+        dbWriteExecutor?.let { executor ->
+            val outcome =
+                StoreLifecycle(
+                    gracefulMillis = 4_000,
+                    forceMillis = 1_000,
+                    log = { msg -> Log.w(TAG, msg) },
+                ).drain(executor)
+            Log.i(TAG, "Reticulum DB executor drained on shutdown: $outcome")
+        }
+        dbWriteExecutor = null
+
+        // Release the durable-write state owned by the RoomIdentityStore
+        // (executor/DAO/database references) AFTER the write executor is drained
+        // and quiescent and BEFORE the database close. A replacement
+        // service/store/database must never observe or flush the retired
+        // instance's backlog.
+        identityStore?.dispose()
+        identityStore = null
 
         database?.close()
         database = null
@@ -311,7 +348,8 @@ class ReticulumService : LifecycleService() {
                 network.reticulum.android.db.ReticulumDatabase::class.java,
                 "reticulum.db"
             ).addMigrations(
-                network.reticulum.android.db.ReticulumDatabase.MIGRATION_1_2
+                network.reticulum.android.db.ReticulumDatabase.MIGRATION_1_2,
+                network.reticulum.android.db.ReticulumDatabase.MIGRATION_2_3,
             ).build()
             database = db
 
@@ -330,8 +368,12 @@ class ReticulumService : LifecycleService() {
                 network.reticulum.android.db.store.RoomAnnounceStore(db.announceCacheDao(), executor)
             network.reticulum.transport.Transport.discoveryStore =
                 network.reticulum.android.db.store.RoomDiscoveryStore(db.discoveredInterfaceDao(), executor)
-            network.reticulum.identity.Identity.identityStore =
-                network.reticulum.android.db.store.RoomIdentityStore(db.knownDestinationDao(), db.identityRatchetDao(), executor)
+            identityStore = network.reticulum.android.db.store.RoomIdentityStore(
+                db.knownDestinationDao(), db.identityRatchetDao(), executor
+            )
+            network.reticulum.identity.Identity.identityStore = identityStore
+            network.reticulum.transport.Transport.destinationRatchetStore =
+                network.reticulum.android.db.store.RoomDestinationRatchetStore(db.destinationRatchetDao(), executor)
 
             Log.i(TAG, "Room database initialized with persistent stores")
 
@@ -340,7 +382,10 @@ class ReticulumService : LifecycleService() {
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 // Migrate existing file-based data to Room (one-time, idempotent)
                 network.reticulum.android.db.FileMigrator(
-                    db, "$configDir/storage", "$configDir/cache"
+                    db = db,
+                    storagePath = "$configDir/storage",
+                    cachePath = "$configDir/cache",
+                    lxmfRatchetsPath = "$configDir/lxmf/ratchets",
                 ).migrateIfNeeded()
 
                 // Configure Transport for coroutine-based job loop on Android
@@ -354,6 +399,49 @@ class ReticulumService : LifecycleService() {
 
                 // Check if another shared instance is already running
                 val sharedInstanceExists = Reticulum.isSharedInstanceRunning(config.sharedInstancePort)
+
+                // Wire the LocalClientInterface factory before Reticulum.start
+                // so its connect-to-shared-instance path has something to call.
+                // Without this, `Reticulum.tryConnectToSharedInstance` logs
+                // "LocalClientInterface factory not set, cannot connect to
+                // shared instance" and silently falls back to standalone
+                // — even when sharedInstanceExists=true. The factory is
+                // applied via the companion's pending-factory mechanism,
+                // which Reticulum.start() picks up between Reticulum(...)
+                // construction and rns.initialize().
+                Reticulum.setLocalClientFactory { port, host ->
+                    network.reticulum.interfaces.local.LocalClientInterface(
+                        name = "SharedInstanceClient",
+                        tcpPort = port,
+                        tcpHost = host,
+                    )
+                }
+
+                // Wire the interface registrar so Transport can send/receive
+                // packets through the shared-instance connection. Without
+                // this, tryConnectToSharedInstance logs "No interface
+                // registrar set, packets will not be processed" — the TCP
+                // socket connects, but every packet arriving from the daemon
+                // is silently dropped (onPacketReceived is never wired) and
+                // Transport never routes outbound packets to the shared
+                // instance. Matches the python ref's behavior at
+                // RNS/Reticulum.py:414 — `RNS.Transport.interfaces.append(interface)`.
+                // The cast to network.reticulum.interfaces.Interface is safe
+                // since the factory above only produces LocalClientInterface,
+                // which extends Interface; the `Any` return type on the
+                // factory exists to keep rns-core decoupled from rns-interfaces.
+                Reticulum.setInterfaceRegistrar { iface ->
+                    if (iface is network.reticulum.interfaces.Interface) {
+                        val ref = network.reticulum.interfaces.InterfaceAdapter.getOrCreate(iface)
+                        network.reticulum.transport.Transport.registerInterface(ref)
+                    }
+                }
+                Reticulum.setInterfaceDeregistrar { iface ->
+                    if (iface is network.reticulum.interfaces.Interface) {
+                        val ref = network.reticulum.interfaces.InterfaceAdapter.getOrCreate(iface)
+                        network.reticulum.transport.Transport.deregisterInterface(ref)
+                    }
+                }
 
                 reticulum = Reticulum.start(
                     configDir = configDir,

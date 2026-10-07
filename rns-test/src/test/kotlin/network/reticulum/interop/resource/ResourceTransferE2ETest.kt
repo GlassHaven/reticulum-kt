@@ -235,4 +235,128 @@ class ResourceTransferE2ETest : RnsLiveTestBase() {
 
         link.teardown()
     }
+
+    @Test
+    @DisplayName("In-memory resource above MAX_EFFICIENT_SIZE completes as a split transfer")
+    @Timeout(180)
+    fun `split in-memory resource from kotlin completes to python`() {
+        val link = establishLink()
+
+        link.setResourceStrategy(Link.ACCEPT_ALL)
+
+        // A payload above MAX_EFFICIENT_SIZE (1 MiB - 1) is split into multiple
+        // segments. The Kotlin sender must spill the in-memory payload to a
+        // temporary file and prepare each continuation segment from that file as
+        // the previous segment's proof arrives - the F3.1 path. Without it, the
+        // sender advertised the whole payload as one transfer, prepared no next
+        // segment, and the proof validator waited for a segment that never
+        // existed, spinning the inbound thread under the node jobs lock (remote
+        // DoS) until the transfer timed out.
+        val testData = ByteArray(1024 * 1024 + 512) { (it % 251).toByte() }
+        val completedLatch = CountDownLatch(1)
+        val completedResource = AtomicReference<Resource>()
+
+        println("  [Test] Sending ${testData.size} byte resource from Kotlin (should split into 2 segments)...")
+
+        val resource = Resource.create(
+            data = testData,
+            link = link,
+            callback = { r ->
+                completedResource.set(r)
+                completedLatch.countDown()
+            }
+        )
+
+        assertNotNull(resource)
+        assertTrue(resource.split, "payload above MAX_EFFICIENT_SIZE must be a split transfer")
+        assertEquals(2, resource.totalSegments, "1 MiB + 512 bytes splits into 2 segments")
+
+        val completed = completedLatch.await(120, TimeUnit.SECONDS)
+        assertTrue(completed, "Split resource transfer should complete within 120 seconds")
+
+        // Poll Python for the assembled resource.
+        val deadline = System.currentTimeMillis() + 30_000
+        var pythonResources: List<ReceivedResource> = emptyList()
+        while (System.currentTimeMillis() < deadline) {
+            pythonResources = getPythonResources()
+            if (pythonResources.isNotEmpty()) break
+            Thread.sleep(500)
+        }
+
+        assertTrue(pythonResources.isNotEmpty(), "Python should receive the split resource")
+        assertTrue(
+            testData.contentEquals(pythonResources[0].data),
+            "Assembled split resource data should match (${testData.size} bytes)"
+        )
+        println("  [Test] Kotlin -> Python split resource transfer verified! (${testData.size} bytes, ${resource.totalSegments} segments)")
+
+        link.teardown()
+    }
+
+    @Test
+    @DisplayName("Python sends a split resource to Kotlin over link")
+    @Timeout(180)
+    fun `split resource from python completes on kotlin`() {
+        val link = establishLink()
+
+        link.setResourceStrategy(Link.ACCEPT_ALL)
+
+        // The receiver's split path: each segment arrives as its own incoming
+        // Resource (initializeFromAdvertisement builds it from the advertisement),
+        // and assemble() reassembles that segment's parts. The Kotlin->Python
+        // test covers the SENDER split path (temp-file spill + per-segment
+        // preparation); this covers the RECEIVER side (per-segment initialize +
+        // assemble).
+        //
+        // Note: the Kotlin receiver delivers each segment to the application as a
+        // SEPARATE Resource - it does not stitch segments into one payload
+        // (the pre-existing, separately-xfail'd "no segment-append" gap). We
+        // therefore collect every segment in order and concatenate here, which
+        // still exercises the per-segment receiver path and proves each segment's
+        // content is correct.
+        val segments = HashMap<Int, ByteArray>()
+        var totalSegmentsSeen = 0
+        var maxSegmentIndex = 0
+        val allArrived = CountDownLatch(1)
+
+        link.callbacks.resourceConcluded = { resourceObj ->
+            val res = resourceObj as? Resource
+            if (res != null) {
+                val data = res.data
+                if (data != null) {
+                    segments[res.segmentIndex] = data
+                    totalSegmentsSeen = res.totalSegments
+                    maxSegmentIndex = maxOf(maxSegmentIndex, res.segmentIndex)
+                    if (maxSegmentIndex == totalSegmentsSeen) {
+                        allArrived.countDown()
+                    }
+                }
+            }
+        }
+
+        // A payload above MAX_EFFICIENT_SIZE (1 MiB - 1) so Python splits it
+        // into 2 segments, which Kotlin must receive and assemble per-segment.
+        val testData = ByteArray(1024 * 1024 + 512) { (it % 251).toByte() }
+
+        println("  [Test] Sending ${testData.size} byte resource from Python (should split into 2 segments)...")
+        val sendResult = python("rns_resource_send", "data" to testData)
+        assertTrue(sendResult.getBoolean("sent"), "Python resource send should succeed")
+
+        val received = allArrived.await(120, TimeUnit.SECONDS)
+        assertTrue(received, "Kotlin should receive all split segments within 120 seconds")
+
+        assertEquals(2, totalSegmentsSeen, "payload above MAX_EFFICIENT_SIZE must be a 2-segment split")
+        assertEquals(2, segments.size, "both segments should have been received and assembled")
+
+        // Reassemble by segment order and verify byte-exactness.
+        val reassembled = segments.entries.sortedBy { it.key }.flatMap { it.value.toList() }.toByteArray()
+        assertEquals(testData.size, reassembled.size, "reassembled size should match the payload")
+        assertTrue(
+            reassembled.contentEquals(testData),
+            "concatenated split segments should match the payload (${testData.size} bytes)"
+        )
+        println("  [Test] Python -> Kotlin split resource transfer verified! (${testData.size} bytes, ${segments.size} segments)")
+
+        link.teardown()
+    }
 }

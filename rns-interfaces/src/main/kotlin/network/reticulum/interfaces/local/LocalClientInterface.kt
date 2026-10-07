@@ -9,7 +9,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.framing.HDLC
 import java.io.IOException
@@ -194,7 +193,7 @@ class LocalClientInterface : Interface {
             // Unix sockets don't support TCP options, ignore
         }
 
-        online.set(true)
+        setOnline(true)
 
         readJob = ioScope.launch {
             readLoop()
@@ -214,7 +213,7 @@ class LocalClientInterface : Interface {
                 throw IllegalStateException("No socket path or TCP port configured")
             }
 
-            online.set(true)
+            setOnline(true)
             neverConnected.set(false)
 
             startWithSocket()
@@ -268,7 +267,7 @@ class LocalClientInterface : Interface {
         try {
             var attempts = 0
 
-            while (!online.get()) {
+            while (!online.value) {
                 attempts++
                 delay(RECONNECT_WAIT)
 
@@ -284,7 +283,7 @@ class LocalClientInterface : Interface {
                 }
             }
 
-            if (!neverConnected.get() && online.get()) {
+            if (!neverConnected.get() && online.value) {
                 log("Reconnected successfully")
             }
         } finally {
@@ -298,12 +297,13 @@ class LocalClientInterface : Interface {
         log("Read loop started")
 
         try {
-            while (online.get() && !detached.get()) {
+            while (online.value && !detached.get()) {
                 val sock = socket ?: break
-                // Blocking read wrapped in IO dispatcher
-                val bytesRead = withContext(Dispatchers.IO) {
-                    sock.getInputStream().read(buffer)
-                }
+                // The enclosing coroutine is launched on `ioScope` which is
+                // already bound to Dispatchers.IO; calling read() directly
+                // matches python's `LocalInterface.py:302 self.socket.recv(4096)`
+                // pattern without a redundant dispatcher hop per iteration.
+                val bytesRead = sock.getInputStream().read(buffer)
 
                 if (bytesRead > 0) {
                     val data = buffer.copyOf(bytesRead)
@@ -312,7 +312,7 @@ class LocalClientInterface : Interface {
                 } else if (bytesRead == -1) {
                     // Connection closed
                     log("Connection closed by remote (read returned -1)")
-                    online.set(false)
+                    setOnline(false)
 
                     if (isSharedInstanceClient.get() && !detached.get()) {
                         log("Connection closed, attempting to reconnect...")
@@ -323,13 +323,13 @@ class LocalClientInterface : Interface {
                     break
                 }
             }
-            log("Read loop exited normally (online=${online.get()}, detached=${detached.get()})")
+            log("Read loop exited normally (online=${online.value}, detached=${detached.get()})")
         } catch (e: CancellationException) {
             // Normal cancellation, don't log as error
         } catch (e: IOException) {
             if (!detached.get()) {
                 log("IOException in read loop: ${e.message}")
-                online.set(false)
+                setOnline(false)
 
                 if (isSharedInstanceClient.get()) {
                     log("Connection error: ${e.message}, attempting to reconnect...")
@@ -349,8 +349,8 @@ class LocalClientInterface : Interface {
     }
 
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) {
-            log("processOutgoing called but interface not online (online=${online.get()}, detached=${detached.get()})")
+        if (!online.value || detached.get()) {
+            log("processOutgoing called but interface not online (online=${online.value}, detached=${detached.get()})")
             throw IllegalStateException("Interface is not online")
         }
 
@@ -371,7 +371,7 @@ class LocalClientInterface : Interface {
             parentInterface?.txBytes?.addAndGet(framedData.size.toLong())
 
         } catch (e: IOException) {
-            online.set(false)
+            setOnline(false)
 
             if (isSharedInstanceClient.get() && !detached.get()) {
                 log("Send error: ${e.message}, will reconnect...")
@@ -391,7 +391,7 @@ class LocalClientInterface : Interface {
 
     override fun detach() {
         if (detached.getAndSet(true)) return
-        online.set(false)
+        setOnline(false)
 
         // Cancel coroutines first
         readJob?.cancel()

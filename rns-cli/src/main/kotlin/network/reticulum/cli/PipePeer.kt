@@ -2,17 +2,20 @@ package network.reticulum.cli
 
 import kotlinx.serialization.json.*
 import network.reticulum.Reticulum
+import network.reticulum.channel.MessageBase
 import network.reticulum.common.DestinationDirection
 import network.reticulum.common.DestinationType
 import network.reticulum.common.InterfaceMode
 import network.reticulum.common.toHexString
 import network.reticulum.destination.Destination
 import network.reticulum.identity.Identity
+import network.reticulum.interfaces.Interface
 import network.reticulum.interfaces.local.LocalClientInterface
 import network.reticulum.interfaces.local.LocalServerInterface
 import network.reticulum.interfaces.pipe.PipeInterface
 import network.reticulum.interfaces.toRef
 import network.reticulum.link.Link
+import network.reticulum.link.LinkConstants
 import network.reticulum.transport.AnnounceHandler
 import network.reticulum.transport.Transport
 import java.io.FileInputStream
@@ -27,12 +30,19 @@ import java.nio.file.Files
  *   stderr: JSON control/status messages (one per line)
  *
  * Environment variables:
- *   PIPE_PEER_ACTION:    announce | listen | link_listen | link_serve | transport
+ *   PIPE_PEER_ACTION:    announce | listen | link_listen | link_serve | channel_serve | transport
  *   PIPE_PEER_APP_NAME:  app name for destination (default: pipetest)
  *   PIPE_PEER_ASPECTS:   comma-separated aspects (default: routing)
  *   PIPE_PEER_TRANSPORT: true | false (default: false)
  *   PIPE_PEER_MODE:      interface mode: full | ap | roaming | boundary | gateway | p2p
  *   PIPE_PEER_SHARED_CLIENT_PORT: TCP port to connect to as LocalClientInterface client
+ *   PIPE_PEER_AUTO_ATTACH:     true | false (default: false). When true, connect to the
+ *                              shared instance via Reticulum.start(connectToSharedInstance=true)
+ *                              + the setLocalClientFactory / setInterfaceRegistrar setters
+ *                              instead of constructing LocalClientInterface manually. This
+ *                              exercises the same auto-attach codepath that rns-android's
+ *                              ReticulumService uses on Android — the only production caller
+ *                              of that codepath today. Requires PIPE_PEER_SHARED_CLIENT_PORT.
  *   PIPE_PEER_NUM_IFACES:      number of fd-pair interfaces (0 = use stdin/stdout)
  *   PIPE_PEER_IFACE_{n}_FD_IN:  read fd for interface n
  *   PIPE_PEER_IFACE_{n}_FD_OUT: write fd for interface n
@@ -43,6 +53,83 @@ private fun fdPath(fd: Int): String = when {
     else -> "/proc/self/fd/$fd"
 }
 
+private class BridgeChannelMessage : MessageBase() {
+    override val msgType: Int = 0x0101
+    var data: ByteArray = ByteArray(0)
+
+    override fun pack(): ByteArray = data
+
+    override fun unpack(raw: ByteArray) {
+        data = raw
+    }
+}
+
+private fun setupChannelPeer(link: Link, sendSequence: Boolean) {
+    val channel = link.getChannel()
+    channel.registerMessageType { BridgeChannelMessage() }
+    channel.addMessageHandler { message ->
+        if (message is BridgeChannelMessage) {
+            emit(buildJsonObject {
+                put("type", "channel_data")
+                put("link_id", link.linkId.toHexString())
+                put("data_hex", message.data.toHexString())
+                put("data_utf8", message.data.decodeToString())
+            })
+            true
+        } else {
+            false
+        }
+    }
+
+    if (!sendSequence) return
+
+    Thread {
+        Thread.sleep(1000)
+        val payloads = listOf("channel-one", "channel-two", "channel-three")
+        for (payload in payloads) {
+            val deadline = System.currentTimeMillis() + 5_000
+            while (System.currentTimeMillis() < deadline &&
+                link.status == LinkConstants.ACTIVE &&
+                !channel.isReadyToSend()
+            ) {
+                Thread.sleep(50)
+            }
+
+            if (link.status != LinkConstants.ACTIVE) {
+                emit(buildJsonObject {
+                    put("type", "error")
+                    put("message", "Link became inactive before channel send")
+                })
+                return@Thread
+            }
+
+            if (!channel.isReadyToSend()) {
+                emit(buildJsonObject {
+                    put("type", "error")
+                    put("message", "Channel never became ready for next send")
+                })
+                return@Thread
+            }
+
+            try {
+                val data = payload.toByteArray()
+                channel.send(BridgeChannelMessage().apply { this.data = data })
+                emit(buildJsonObject {
+                    put("type", "channel_sent")
+                    put("link_id", link.linkId.toHexString())
+                    put("data_hex", data.toHexString())
+                })
+            } catch (e: Exception) {
+                emit(buildJsonObject {
+                    put("type", "error")
+                    put("message", "Channel send failed: ${e.message}")
+                })
+                return@Thread
+            }
+        }
+    }.apply { isDaemon = true }.start()
+}
+
 fun main() {
     val action = System.getenv("PIPE_PEER_ACTION") ?: "announce"
     val appName = System.getenv("PIPE_PEER_APP_NAME") ?: "pipetest"
@@ -51,6 +138,11 @@ fun main() {
     val modeStr = System.getenv("PIPE_PEER_MODE") ?: "full"
     val sharedPort = System.getenv("PIPE_PEER_SHARED_PORT")?.toIntOrNull() ?: 0
     val sharedClientPort = System.getenv("PIPE_PEER_SHARED_CLIENT_PORT")?.toIntOrNull() ?: 0
+    val autoAttach = System.getenv("PIPE_PEER_AUTO_ATTACH")?.lowercase() == "true"
+
+    require(!autoAttach || sharedClientPort > 0) {
+        "PIPE_PEER_AUTO_ATTACH=true requires PIPE_PEER_SHARED_CLIENT_PORT to be set"
+    }
 
     val mode = when (modeStr.lowercase()) {
         "ap", "access_point" -> InterfaceMode.ACCESS_POINT
@@ -65,11 +157,38 @@ fun main() {
     val configDir = Files.createTempDirectory("rns-kt-pipe-peer-").toFile()
 
     try {
-        // Start Reticulum
-        Reticulum.start(
-            configDir = configDir.absolutePath,
-            enableTransport = enableTransport
-        )
+        if (autoAttach) {
+            // Auto-attach codepath: mirror exactly what rns-android.ReticulumService
+            // does on Android. The factory and registrar setters are codependent — if
+            // either is missing, packets are silently dropped despite "Connected to
+            // shared instance" logging. This branch exists to keep that contract
+            // exercised in CI; rns-android is otherwise the only production caller.
+            Reticulum.setLocalClientFactory { port, host ->
+                LocalClientInterface(name = "AutoAttachClient", tcpPort = port, tcpHost = host)
+            }
+            Reticulum.setInterfaceRegistrar { iface ->
+                if (iface is Interface) {
+                    Transport.registerInterface(iface.toRef())
+                }
+            }
+            Reticulum.setInterfaceDeregistrar { iface ->
+                if (iface is Interface) {
+                    Transport.deregisterInterface(iface.toRef())
+                }
+            }
+
+            Reticulum.start(
+                configDir = configDir.absolutePath,
+                enableTransport = enableTransport,
+                connectToSharedInstance = true,
+                sharedInstancePort = sharedClientPort
+            )
+        } else {
+            Reticulum.start(
+                configDir = configDir.absolutePath,
+                enableTransport = enableTransport
+            )
+        }
 
         // Create interfaces: shared instance server and/or pipe-based.
         // These are NOT mutually exclusive — a target can serve as both a
@@ -82,7 +201,9 @@ fun main() {
         }
 
         // Connect as client to an existing shared instance (e.g., Python rnsd)
-        if (sharedClientPort > 0) {
+        // Skipped when autoAttach=true — Reticulum.start() already created and
+        // registered the LocalClientInterface via the factory+registrar path.
+        if (sharedClientPort > 0 && !autoAttach) {
             val client = LocalClientInterface(
                 name = "SharedClient",
                 tcpPort = sharedClientPort
@@ -273,6 +394,40 @@ fun main() {
                             })
                         }
                     }.apply { isDaemon = true }.start()
+                }
+                destination.announce()
+                emit(buildJsonObject {
+                    put("type", "announced")
+                    put("destination_hash", destination.hash.toHexString())
+                    put("identity_hash", identity.hash.toHexString())
+                    put("identity_public_key", identity.getPublicKey().toHexString())
+                })
+                pathTableDumper()
+            }
+            "channel_serve" -> {
+                val identity = Identity.create()
+                val destination = Destination.create(
+                    identity = identity,
+                    direction = DestinationDirection.IN,
+                    type = DestinationType.SINGLE,
+                    appName = appName,
+                    aspects = aspects
+                )
+                destination.setLinkEstablishedCallback { linkAny ->
+                    val link = linkAny as Link
+                    emit(buildJsonObject {
+                        put("type", "link_established")
+                        put("link_id", link.linkId.toHexString())
+                        put("destination_hash", destination.hash.toHexString())
+                    })
+                    link.setLinkClosedCallback { closedLink ->
+                        emit(buildJsonObject {
+                            put("type", "link_closed")
+                            put("link_id", closedLink.linkId.toHexString())
+                            put("destination_hash", destination.hash.toHexString())
+                        })
+                    }
+                    setupChannelPeer(link, sendSequence = true)
                 }
                 destination.announce()
                 emit(buildJsonObject {

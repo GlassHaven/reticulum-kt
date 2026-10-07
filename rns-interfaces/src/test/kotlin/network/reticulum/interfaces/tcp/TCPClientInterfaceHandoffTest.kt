@@ -94,6 +94,6 @@ class TCPClientInterfaceHandoffTest {
             3, publishedConnections.get(),
             "teardown-triggered reconnect during an active owner was dropped"
         )
-        assertTrue(iface.online.get(), "interface should be online after the honored reconnect")
+        assertTrue(iface.online.value, "interface should be online after the honored reconnect")
     }
 }

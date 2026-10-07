@@ -51,6 +51,8 @@ class UDPInterface(
     companion object {
         const val BITRATE_GUESS = 10_000_000 // 10 Mbps
         const val HW_MTU = 1064 // Must match Python reference for interop
+        /** Default IFAC tag length in bytes for packet/IP media (python UDPInterface.py:42). */
+        const val DEFAULT_IFAC_SIZE = 16
         const val DEFAULT_BUFFER_SIZE = 4096
 
         /**
@@ -135,7 +137,7 @@ class UDPInterface(
                 setupSender()
             }
 
-            online.set(true)
+            setOnline(true)
             log("Interface started successfully")
 
         } catch (e: Exception) {
@@ -305,7 +307,7 @@ class UDPInterface(
     }
 
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) {
+        if (!online.value || detached.get()) {
             throw IllegalStateException("Interface is not online")
         }
 
@@ -342,7 +344,7 @@ class UDPInterface(
 
         log("Detaching interface")
         running.set(false)
-        online.set(false)
+        setOnline(false)
 
         // Cancel coroutines first
         readJob?.cancel()

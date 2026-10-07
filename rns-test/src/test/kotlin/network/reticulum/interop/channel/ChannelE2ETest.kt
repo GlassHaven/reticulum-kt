@@ -9,6 +9,8 @@ import network.reticulum.interop.getString
 import network.reticulum.interop.hexToByteArray
 import network.reticulum.link.Link
 import network.reticulum.link.LinkConstants
+import network.reticulum.packet.Packet
+import network.reticulum.packet.PacketReceipt
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
@@ -197,6 +199,41 @@ class ChannelE2ETest : RnsLiveTestBase() {
     }
 
     @Test
+    @DisplayName("Channel send receives delivery proof")
+    @Timeout(30)
+    fun `channel send receives delivery proof`() {
+        val (link, _) = establishLinkWithChannel()
+
+        python("rns_channel_clear_messages")
+        Thread.sleep(500)
+
+        val channel = link.getChannel()
+        val envelope = channel.send(TestMessage().apply { data = "proof-check".toByteArray() })
+        val packet = envelope.packet as? Packet
+        assertNotNull(packet, "Channel send should create a backing Packet")
+        assertNotNull(packet.receipt, "Channel packet should have a PacketReceipt")
+
+        val deadline = System.currentTimeMillis() + 5_000
+        while (System.currentTimeMillis() < deadline) {
+            if (packet.receipt?.status == PacketReceipt.DELIVERED) break
+            if (link.status == LinkConstants.CLOSED) break
+            Thread.sleep(50)
+        }
+
+        assertEquals(
+            PacketReceipt.DELIVERED,
+            packet.receipt?.status,
+            "Channel packet receipt should validate the returned link proof"
+        )
+        assertEquals(LinkConstants.ACTIVE, link.status, "Link should remain active after proof validation")
+
+        val pyResult = python("rns_channel_get_messages")
+        assertTrue(pyResult.getInt("count") > 0, "Python should receive the channel message")
+
+        link.teardown()
+    }
+
+    @Test
     @DisplayName("Multiple channel messages in sequence")
     @Timeout(45)
     fun `multiple channel messages in sequence`() {
@@ -208,10 +245,10 @@ class ChannelE2ETest : RnsLiveTestBase() {
         val channel = link.getChannel()
         val messageCount = 5
 
-        // Send multiple K→P messages. The channel has a send window that may
-        // fill up if proof validation fails (known issue with link packet proofs),
-        // so we send as many as the window allows.
-        println("  [Test] Sending up to $messageCount channel messages K→P...")
+        // Send all K→P messages. With the proof callback deadlock fixed, the
+        // channel send window should reopen after each proof so every message
+        // in the loop is sendable.
+        println("  [Test] Sending $messageCount channel messages K→P...")
         var sentCount = 0
         for (i in 0 until messageCount) {
             val msg = TestMessage().apply { data = "Message $i from Kotlin".toByteArray() }
@@ -220,15 +257,15 @@ class ChannelE2ETest : RnsLiveTestBase() {
             while (!channel.isReadyToSend() && System.currentTimeMillis() < readyDeadline) {
                 Thread.sleep(50)
             }
-            if (!channel.isReadyToSend()) {
-                println("  [Test] Channel window full after $sentCount messages (proof pipeline issue)")
-                break
-            }
+            assertTrue(
+                channel.isReadyToSend(),
+                "Channel window should reopen after each proof — stalled after $sentCount messages",
+            )
             channel.send(msg)
             sentCount++
         }
 
-        assertTrue(sentCount > 0, "Should send at least one channel message")
+        // sentCount == messageCount is guaranteed by the assertTrue inside the loop.
 
         // Wait for Python to receive sent messages
         val deadline = System.currentTimeMillis() + 15_000

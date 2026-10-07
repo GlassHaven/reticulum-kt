@@ -46,6 +46,9 @@ class PipeInterface(
 
         /** Hardware MTU (matches Python PipeInterface.HW_MTU = 1064). */
         const val HW_MTU = 1064
+
+        /** Default IFAC tag length in bytes for framed-serial media (python PipeInterface.py:57). */
+        const val DEFAULT_IFAC_SIZE = 8
     }
 
     override val bitrate: Int = bitrateEstimate
@@ -58,7 +61,7 @@ class PipeInterface(
     private var readThread: Thread? = null
 
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) return
+        if (!online.value || detached.get()) return
 
         val framed = HDLC.frame(data)
         synchronized(outputStream) {
@@ -66,7 +69,7 @@ class PipeInterface(
                 outputStream.write(framed)
                 outputStream.flush()
             } catch (_: IOException) {
-                online.set(false)
+                setOnline(false)
                 return
             }
         }
@@ -74,7 +77,7 @@ class PipeInterface(
     }
 
     override fun start() {
-        online.set(true)
+        setOnline(true)
         readThread = Thread(::readLoop).apply {
             isDaemon = true
             name = "PipeInterface[$name]-read"
@@ -85,7 +88,7 @@ class PipeInterface(
     private fun readLoop() {
         val buffer = ByteArray(MAX_CHUNK)
         try {
-            while (online.get() && !detached.get()) {
+            while (online.value && !detached.get()) {
                 val bytesRead = inputStream.read(buffer)
                 if (bytesRead == -1) break
                 hdlcDeframer.process(buffer.copyOf(bytesRead))
@@ -93,7 +96,7 @@ class PipeInterface(
         } catch (_: IOException) {
             // Stream closed — expected on shutdown
         }
-        online.set(false)
+        setOnline(false)
     }
 
     override fun detach() {

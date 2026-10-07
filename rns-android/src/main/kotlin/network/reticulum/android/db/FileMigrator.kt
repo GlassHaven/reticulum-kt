@@ -2,6 +2,7 @@ package network.reticulum.android.db
 
 import android.util.Log
 import network.reticulum.android.db.entity.AnnounceCacheEntity
+import network.reticulum.android.db.entity.DestinationRatchetEntity
 import network.reticulum.android.db.entity.DiscoveredInterfaceEntity
 import network.reticulum.android.db.entity.IdentityRatchetEntity
 import network.reticulum.android.db.entity.KnownDestinationEntity
@@ -21,11 +22,29 @@ import java.io.File
 class FileMigrator(
     private val db: ReticulumDatabase,
     private val storagePath: String,
-    private val cachePath: String
+    private val cachePath: String,
+    /**
+     * Optional LXMF ratchet directory. When LXMF-kt is in the dependency tree
+     * it writes per-destination ratchet private keys under
+     * `$configDir/lxmf/ratchets/<hash>` (Kotlin) or `<hash>.ratchets` (Python
+     * reference layout). Pass `$configDir/lxmf/ratchets` here and FileMigrator
+     * will import those into the destination_ratchets Room table and scrub the
+     * files. Leave null for bare rns-core deployments.
+     */
+    private val lxmfRatchetsPath: String? = null,
 ) {
     fun migrateIfNeeded() {
         val marker = File(storagePath, ".room_migrated")
-        if (marker.exists()) return
+        if (marker.exists()) {
+            // Full migration already ran, but earlier versions of this migrator
+            // didn't know about the LXMF destination-ratchet files (they were
+            // added later) and left legacy source files on disk forever.
+            // Re-import ratchets and run the scrub on every launch — upsert
+            // is idempotent, so repeated runs are safe.
+            migrateDestinationRatchets()
+            deleteLegacySourceFiles()
+            return
+        }
 
         Log.i(TAG, "Starting file-to-Room migration...")
         val start = System.currentTimeMillis()
@@ -37,13 +56,118 @@ class FileMigrator(
             migrateTunnels()
             migrateAnnounceCache()
             migrateRatchets()
+            migrateDestinationRatchets()
             migrateDiscovery()
 
+            // storagePath is no longer eagerly created by Reticulum.initialize(),
+            // so make sure it exists before dropping the marker.
+            marker.parentFile?.mkdirs()
             marker.createNewFile()
+            // Room is authoritative for every entity we just imported — delete
+            // the source files so they don't drift out of sync and don't leak
+            // sensitive routing state via backup archives or forensic access.
+            deleteLegacySourceFiles()
             Log.i(TAG, "Migration completed in ${System.currentTimeMillis() - start}ms")
         } catch (e: Exception) {
             Log.e(TAG, "Migration failed: ${e.message}", e)
             // Don't create marker — will retry next launch
+        }
+    }
+
+    /**
+     * Remove legacy file-backed state that is now mirrored in Room.
+     * Best-effort: each delete is isolated so a single failure doesn't abort
+     * the rest. Safe to run when the files are already gone.
+     *
+     * Note on `ratchets/`: `migrateRatchets()` intentionally skips `.out`
+     * files, but those are just transient atomic-write staging (see
+     * `Identity.persistRatchet()` — it writes to `$hash.out`, then renames
+     * to `$hash`). A stranded `.out` file means a write was interrupted and
+     * the data is not authoritative; safe to delete alongside the real
+     * ratchet files that Room now owns.
+     *
+     * Note on `discovery/`: the migrator only touches
+     * `discovery/interfaces/`, so we scope the delete there rather than
+     * nuking the whole `discovery/` tree — future subdirectories should
+     * not be silently wiped.
+     */
+    private fun deleteLegacySourceFiles() {
+        val storageFiles = listOf(
+            "destination_table",
+            "packet_hashlist",
+            "known_destinations",
+            "known_destinations.tmp",
+            "tunnels"
+        )
+        for (name in storageFiles) {
+            runCatching { File(storagePath, name).delete() }
+        }
+        runCatching { File(cachePath, "announces").deleteRecursively() }
+        runCatching { File(storagePath, "ratchets").deleteRecursively() }
+        runCatching { File(storagePath, "discovery/interfaces").deleteRecursively() }
+        // LXMF per-destination ratchets — only present when LXMF-kt is in use.
+        // Both filename flavours (Kotlin's `<hash>`, Python's `<hash>.ratchets`)
+        // landed under the same directory.
+        lxmfRatchetsPath?.let { runCatching { File(it).deleteRecursively() } }
+    }
+
+    /**
+     * Import LXMF per-destination inbound ratchets into Room.
+     *
+     * The on-disk blob (`{signature, ratchets}` msgpack) is stored opaquely —
+     * `Destination.reloadRatchets` unpacks it and verifies the signature when
+     * the router re-registers the destination. This keeps the migration
+     * signature-agnostic, so it still works when the destination's identity
+     * isn't materialized at migration time.
+     *
+     * Accepts both `<hash>` (LXMF-kt layout) and `<hash>.ratchets` (Python
+     * LXMF reference layout); strips the suffix when parsing the hash.
+     */
+    private fun migrateDestinationRatchets() {
+        val dir = lxmfRatchetsPath?.let { File(it) } ?: return
+        if (!dir.exists() || !dir.isDirectory) return
+        try {
+            var count = 0
+            var skipped = 0
+            for (file in dir.listFiles() ?: emptyArray()) {
+                if (!file.isFile) continue
+                if (file.name.endsWith(".tmp")) continue
+                val hashName = file.name.removeSuffix(".ratchets")
+                val destHash =
+                    try {
+                        hexToBytes(hashName)
+                    } catch (e: Exception) {
+                        // deleteLegacySourceFiles will erase this file afterwards, so
+                        // log loudly — the operator gets no other chance to catch an
+                        // unparseable filename before it's gone.
+                        Log.w(TAG, "Skipping non-hex ratchet filename ${file.name}: ${e.message}")
+                        skipped++
+                        continue
+                    }
+                try {
+                    db.destinationRatchetDao().upsert(
+                        DestinationRatchetEntity(destHash = destHash, data = file.readBytes()),
+                    )
+                    count++
+                } catch (e: Exception) {
+                    // Same reasoning as above — file is about to be deleted. If this
+                    // was a transient SQLite error the destination loses ratchet
+                    // history until the next rotation, so surface it clearly.
+                    Log.w(
+                        TAG,
+                        "Failed to import ratchet file ${file.name} for destination " +
+                            "${hashName.take(8)}... into Room: ${e.message}",
+                    )
+                    skipped++
+                }
+            }
+            if (skipped > 0) {
+                Log.w(TAG, "Migrated $count destination ratchets, skipped $skipped")
+            } else {
+                Log.i(TAG, "Migrated $count destination ratchets")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to migrate destination ratchets: ${e.message}")
         }
     }
 

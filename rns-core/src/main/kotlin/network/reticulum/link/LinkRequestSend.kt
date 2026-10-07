@@ -19,8 +19,7 @@ package network.reticulum.link
  * reported the outcome.
  *
  * Kept as a pure function so the honesty of the message is testable without a
- * transport, matching [network.reticulum.transport.OutboundRoute] and
- * `AnnounceFilter`.
+ * transport, matching `AnnounceFilter`.
  *
  * @return the failure text when [sent] is false, or null when the request went out.
  */

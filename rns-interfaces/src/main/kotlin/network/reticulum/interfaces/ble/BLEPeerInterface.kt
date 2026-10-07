@@ -85,7 +85,7 @@ class BLEPeerInterface(
      * Called by [BLEInterface] after spawning and registering with Transport.
      */
     fun startReceiving() {
-        online.set(true)
+        setOnline(true)
 
         receiveJob = scope.launch { receiveLoop() }
         keepaliveJob = scope.launch { keepaliveLoop() }
@@ -93,21 +93,51 @@ class BLEPeerInterface(
     }
 
     /**
-     * Poll RSSI every 10 seconds on central (outgoing) connections.
-     * Peripheral connections don't have a GATT client handle, so RSSI reads are unsupported.
+     * Poll RSSI every 10 seconds on central (outgoing) connections and mirror
+     * the value into the base-class [rStatRssi] so Transport.inbound annotates
+     * every received packet with it. This is a poll-interval-stale proxy for
+     * per-packet RSSI — Android's BluetoothGatt does not expose RSSI per GATT
+     * notification. Peripheral connections have no GATT client handle so
+     * [android.bluetooth.BluetoothGatt.readRemoteRssi] is unavailable there;
+     * we leave [rStatRssi] null on that side (packets stay un-annotated).
+     *
+     * Visible as `internal` (rather than private) so unit tests can exercise
+     * the seed-from-[discoveryRssi] path without waiting on a real 10-second
+     * GATT polling loop. The per-tick poll logic lives in [pollAndApplyRssi]
+     * and is tested separately.
      */
-    private fun startRssiPolling() {
+    internal fun startRssiPolling() {
         if (!isOutgoing) return
+        // Seed with the scan-time RSSI so packets received during the first
+        // 10-second polling window are still annotated with a meaningful value.
+        rStatRssi = discoveryRssi
         rssiJob = scope.launch {
-            while (online.get() && !detached.get()) {
+            while (online.value && !detached.get()) {
                 delay(10_000)
-                if (!online.get() || detached.get()) break
-                try {
-                    currentRssi = connection.readRemoteRssi()
-                } catch (_: Exception) {
-                    // Not all connections support RSSI reading — silently ignore
-                }
+                if (!online.value || detached.get()) break
+                pollAndApplyRssi()
             }
+        }
+    }
+
+    /**
+     * One RSSI poll tick: read from the GATT connection and mirror the result
+     * into both [currentRssi] (for peer scoring) and the base-class
+     * [rStatRssi] (for per-packet annotation via Transport.inbound). Any
+     * exception from [BLEPeerConnection.readRemoteRssi] is silently swallowed
+     * so a flaky read doesn't clobber a previously-valid reading.
+     *
+     * Visible as `internal` so unit tests can call it directly with a fake
+     * connection, avoiding the 10-second `delay` inside [startRssiPolling]'s
+     * launch block.
+     */
+    internal suspend fun pollAndApplyRssi() {
+        try {
+            val rssi = connection.readRemoteRssi()
+            currentRssi = rssi
+            rStatRssi = rssi
+        } catch (_: Exception) {
+            // Not all connections support RSSI reading — silently ignore
         }
     }
 
@@ -118,7 +148,7 @@ class BLEPeerInterface(
     private suspend fun receiveLoop() {
         try {
             connection.receivedFragments.collect { fragment ->
-                if (!online.get() || detached.get()) return@collect
+                if (!online.value || detached.get()) return@collect
 
                 // Any traffic resets the zombie detection timer
                 lastTrafficReceived = System.currentTimeMillis()
@@ -160,7 +190,7 @@ class BLEPeerInterface(
      * so we bridge with runBlocking(Dispatchers.IO).
      */
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) return
+        if (!online.value || detached.get()) return
 
         try {
             val fragments = fragmenter.fragment(data)
@@ -188,10 +218,10 @@ class BLEPeerInterface(
      */
     private suspend fun keepaliveLoop() {
         try {
-            while (online.get() && !detached.get()) {
+            while (online.value && !detached.get()) {
                 delay(BLEConstants.KEEPALIVE_INTERVAL_MS)
 
-                if (!online.get() || detached.get()) break
+                if (!online.value || detached.get()) break
 
                 try {
                     connection.sendFragment(byteArrayOf(BLEConstants.KEEPALIVE_BYTE))
@@ -200,7 +230,7 @@ class BLEPeerInterface(
                     log("Keepalive failed, grace period...")
                     delay(BLEConstants.KEEPALIVE_INTERVAL_MS)
 
-                    if (!online.get() || detached.get()) break
+                    if (!online.value || detached.get()) break
 
                     try {
                         connection.sendFragment(byteArrayOf(BLEConstants.KEEPALIVE_BYTE))
@@ -252,7 +282,7 @@ class BLEPeerInterface(
 
     override fun detach() {
         if (detached.getAndSet(true)) return
-        online.set(false)
+        setOnline(false)
 
         // Cancel coroutines
         receiveJob?.cancel()

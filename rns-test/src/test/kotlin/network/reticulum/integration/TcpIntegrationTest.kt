@@ -67,8 +67,8 @@ class TcpIntegrationTest {
         // Wait for connection
         Thread.sleep(500)
 
-        assertTrue(server.online.get(), "Server should be online")
-        assertTrue(client.online.get(), "Client should be online")
+        assertTrue(server.online.value, "Server should be online")
+        assertTrue(client.online.value, "Client should be online")
         assertEquals(1, server.clientCount(), "Server should have one client")
     }
 
@@ -128,10 +128,19 @@ class TcpIntegrationTest {
 
         Thread.sleep(300)
 
-        // Send a test packet from server (broadcasts to all clients)
-        // Must be > HEADER_MIN_SIZE (19 bytes) to pass HDLC deframer
+        // Send a test packet from server to the connected client.
+        // Matches Python semantics (TCPInterface.py:627-628): parent
+        // `process_outgoing` is a pass — the spawned child interfaces
+        // are what actually write to the wire, addressed individually by
+        // Transport.outbound via `Transport.interfaces`. The pre-#46
+        // fan-out loop that let `server.processOutgoing(data)` reach
+        // every client at once is gone; production code reaches a peer
+        // through its spawned child, which is what we exercise here.
+        // Must be > HEADER_MIN_SIZE (19 bytes) to pass HDLC deframer.
         val testData = ByteArray(24) { (it + 0x10).toByte() }
-        server.processOutgoing(testData)
+        val spawnedChild = server.getClients().firstOrNull()
+        assertNotNull(spawnedChild, "Server should have a spawned child for the connected client")
+        spawnedChild!!.processOutgoing(testData)
 
         // Wait for receive
         assertTrue(receivedLatch.await(5, TimeUnit.SECONDS), "Should receive packet")
@@ -148,6 +157,17 @@ class TcpIntegrationTest {
 
         // Create server
         server = TCPServerInterface("test-server", "127.0.0.1", testPort)
+
+        // Register each spawned per-connection child with Transport, exactly as
+        // real consumers do (conformance-bridge WireTcp.kt:280, rns-android).
+        // TCPServerInterface delegates child registration to the consumer via
+        // onClientConnected (see TCPServerInterface.kt:83), and Python registers
+        // the spawned interface itself (TCPInterface.py:633). Without this, the
+        // receiving interface for a client-sourced announce isn't in
+        // Transport.interfaces, so the learned path correctly reads as dangling.
+        server.onClientConnected = { spawnedChild ->
+            Transport.registerInterface(spawnedChild.toRef())
+        }
         server.start()
 
         // Start transport and register server interface
@@ -242,10 +262,14 @@ class TcpIntegrationTest {
             Thread.sleep(50)
         }
 
-        // Send 5 packets from server to client
+        // Send 5 packets from server to client through the spawned child
+        // (server parent's processOutgoing is a no-op per Python semantics,
+        // see `Server can send packet to client` above for the full note).
+        val spawnedChild = server.getClients().firstOrNull()
+        assertNotNull(spawnedChild, "Server should have a spawned child for the connected client")
         for (i in 0 until 5) {
             val testData = ByteArray(24) { (it + i + 100).toByte() }
-            server.processOutgoing(testData)
+            spawnedChild!!.processOutgoing(testData)
             Thread.sleep(50)
         }
 

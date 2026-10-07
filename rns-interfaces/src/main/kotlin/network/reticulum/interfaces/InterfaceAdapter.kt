@@ -17,10 +17,10 @@ class InterfaceAdapter private constructor(
     override val hash: ByteArray = iface.getHash()
     override val canSend: Boolean = iface.canSend
     override val canReceive: Boolean = iface.canReceive
-    override val online: Boolean get() = iface.online.get()
+    override val online: Boolean get() = iface.online.value
     override val rxBytes: Long get() = iface.rxBytes.get()
     override val txBytes: Long get() = iface.txBytes.get()
-    override val mode: InterfaceMode get() = iface.mode
+    override val mode: InterfaceMode get() = iface.modeOverride ?: iface.mode
     override val announceCap: Double get() = iface.announceCap
     override val hwMtu: Int get() = iface.hwMtu ?: RnsConstants.MTU
     override val supportsLinkMtuDiscovery: Boolean get() = iface.supportsLinkMtuDiscovery
@@ -73,6 +73,7 @@ class InterfaceAdapter private constructor(
     override val discoveryLongitude: Double? get() = iface.discoveryLongitude
     override val discoveryHeight: Double? get() = iface.discoveryHeight
     override val discoveryInterfaceType: String get() = iface.discoveryInterfaceType
+    override val kissFraming: Boolean get() = iface.kissFraming
     override val ifacNetname: String? get() = iface.ifacNetname
     override val ifacNetkey: String? get() = iface.ifacNetkey
 

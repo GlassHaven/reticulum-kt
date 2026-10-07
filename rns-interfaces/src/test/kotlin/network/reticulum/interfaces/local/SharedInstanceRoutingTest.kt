@@ -17,6 +17,12 @@ import java.util.concurrent.TimeUnit
  * client interfaces (Transport.py:1697-1742), bypassing announce
  * queue and rate limiting. Kotlin was queuing announces, causing
  * them to get stuck in rate-limited queues.
+ *
+ * Ports: every server is bound to an ephemeral port (tcpPort = 0) and the
+ * clients connect to server!!.boundPort. Fixed literals (the old 37434-37441)
+ * fall inside the OS ephemeral range, so a bind could collide with an
+ * ephemeral allocation or a sibling test's socket and fail with
+ * BindException in CI (same flake class #96 eliminated in LocalInterfaceTest).
  */
 class SharedInstanceRoutingTest {
 
@@ -42,9 +48,9 @@ class SharedInstanceRoutingTest {
 
     @Test
     fun `client interfaces spawned by server are tracked`() {
-        val tcpPort = 37434
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         // Connect clients
         val client1 = LocalClientInterface(name = "Client1", tcpPort = tcpPort)
@@ -65,9 +71,9 @@ class SharedInstanceRoutingTest {
 
     @Test
     fun `spawned client interfaces have parent reference`() {
-        val tcpPort = 37435
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         val client = LocalClientInterface(name = "Client", tcpPort = tcpPort)
         clients.add(client)
@@ -94,13 +100,13 @@ class SharedInstanceRoutingTest {
         //
         // Python reference: LocalInterface.py:454-455
 
-        val tcpPort = 37436
         val testData = "Test data".toByteArray()
         val receivedLatch = CountDownLatch(1)
         var receivedCount = 0
 
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         val client = LocalClientInterface(name = "Client", tcpPort = tcpPort)
         client.onPacketReceived = { _, _ ->
@@ -128,14 +134,14 @@ class SharedInstanceRoutingTest {
         // Verify that spawned client interfaces can send data to external clients.
         // In production, Transport calls each spawned client's processOutgoing() directly.
 
-        val tcpPort = 37437
         // Data must be > HEADER_MIN_SIZE (19) bytes to pass HDLC deframer validation
         val testData = "Test data from server!".toByteArray()
         val receivedLatch = CountDownLatch(1)
         var receivedData: ByteArray? = null
 
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         val client = LocalClientInterface(name = "Client", tcpPort = tcpPort)
         client.onPacketReceived = { data, _ ->
@@ -161,9 +167,9 @@ class SharedInstanceRoutingTest {
 
     @Test
     fun `spawned clients tracked in spawnedInterfaces list`() {
-        val tcpPort = 37438
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         // Initially no spawned interfaces
         assertTrue(server!!.spawnedInterfaces?.isEmpty() ?: true)
@@ -193,9 +199,9 @@ class SharedInstanceRoutingTest {
 
     @Test
     fun `spawned client has isConnectedToSharedInstance method`() {
-        val tcpPort = 37439
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         val client = LocalClientInterface(name = "Client", tcpPort = tcpPort)
         clients.add(client)
@@ -215,11 +221,11 @@ class SharedInstanceRoutingTest {
 
     @Test
     fun `multiple clients can connect simultaneously`() {
-        val tcpPort = 37440
         val numClients = 5
 
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         // Connect multiple clients in parallel
         repeat(numClients) { i ->
@@ -228,7 +234,13 @@ class SharedInstanceRoutingTest {
             client.start()
         }
 
-        Thread.sleep(500)
+        // Poll until all clients have been accepted and spawned (the accept
+        // thread runs handleNewClient, so clientCount() lags the synchronous
+        // client.start() calls under load; a fixed sleep here is a flake).
+        val deadline = System.currentTimeMillis() + 5000
+        while (System.currentTimeMillis() < deadline && server!!.clientCount() < numClients) {
+            Thread.sleep(10)
+        }
 
         // All clients should be connected and tracked
         assertEquals(numClients, server!!.clientCount())
@@ -242,9 +254,9 @@ class SharedInstanceRoutingTest {
 
     @Test
     fun `server disconnection cleans up all clients`() {
-        val tcpPort = 37441
-        server = LocalServerInterface(name = "TestServer", tcpPort = tcpPort)
+        server = LocalServerInterface(name = "TestServer", tcpPort = 0)
         server!!.start()
+        val tcpPort = server!!.boundPort
 
         // Connect clients
         repeat(3) { i ->
@@ -262,7 +274,7 @@ class SharedInstanceRoutingTest {
 
         // All clients should be disconnected
         clients.forEach { client ->
-            assertFalse(client.online.get())
+            assertFalse(client.online.value)
         }
     }
 }

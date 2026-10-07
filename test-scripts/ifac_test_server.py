@@ -20,8 +20,10 @@ import time
 import tempfile
 import os
 
-# Add RNS to path if needed
-sys.path.insert(0, os.path.expanduser("~/repos/Reticulum"))
+# Add RNS to path if needed; honors the same PYTHON_RNS_PATH the CI
+# workflow and python-bridge/bridge_server.py use
+rns_path = os.environ.get("PYTHON_RNS_PATH", "~/repos/Reticulum")
+sys.path.insert(0, os.path.expanduser(rns_path))
 
 import RNS
 

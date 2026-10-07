@@ -10,6 +10,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import network.reticulum.Reticulum
 import network.reticulum.identity.Identity
 import network.reticulum.interfaces.IfacCredentials
 import network.reticulum.interfaces.IfacUtils
@@ -41,6 +42,7 @@ class TCPClientInterface(
     private val targetPort: Int,
     private val useKissFraming: Boolean = false,
     private val connectTimeoutMs: Int = INITIAL_CONNECT_TIMEOUT,
+    // Python RECONNECT_MAX_TRIES parity: null retries indefinitely.
     private val maxReconnectAttempts: Int? = null,
     /** Enable TCP keep-alive. Default true for Python RNS compatibility (can disable for mobile battery). */
     private val keepAlive: Boolean = true,
@@ -53,6 +55,13 @@ class TCPClientInterface(
      * When provided, creates child scope that cancels when parent cancels - for Android service usage.
      */
     private val parentScope: CoroutineScope? = null,
+    // Configured bitrate in bps. Below MINIMUM_BITRATE is ignored, keeping
+    // BITRATE_GUESS (python Reticulum.py:765-768).
+    bitrate: Int? = null,
+    // Pinned link MTU in bytes (FIXED_MTU mode; the bridge's fixed_mtu knob).
+    private val fixedMtuBytes: Int? = null,
+    // Configured IFAC size in BITS (python Reticulum.py:719-723 bits->bytes floor).
+    private val ifacSizeBits: Int? = null,
     /**
      * Optional dialer used in place of the default `Socket()` + `connect()`
      * pair. Lets callers route the underlying TCP through a userspace
@@ -71,17 +80,29 @@ class TCPClientInterface(
     companion object {
         const val BITRATE_GUESS = 10_000_000 // 10 Mbps
         const val HW_MTU = 262144
+        /** Default IFAC tag length in bytes for packet/IP media (python TCPInterface.py:77). */
+        const val DEFAULT_IFAC_SIZE = 16
         const val INITIAL_CONNECT_TIMEOUT = 5000 // 5 seconds
 
-        @Deprecated("Use ExponentialBackoff instead", level = DeprecationLevel.WARNING)
+        /** Fixed reconnect wait matching Python TCPClientInterface.RECONNECT_WAIT. */
         const val RECONNECT_WAIT_MS = 5000L // 5 seconds
 
         /** Enable verbose debug logging via -Dreticulum.tcp.debug=true */
         private val DEBUG = System.getProperty("reticulum.tcp.debug", "false").toBoolean()
     }
 
-    override val bitrate: Int = BITRATE_GUESS
-    override val hwMtu: Int = HW_MTU
+    // python Reticulum.py:765-768 — sub-minimum bitrate ignored, keeps BITRATE_GUESS.
+    override val bitrate: Int =
+        if (bitrate != null && bitrate >= Reticulum.MINIMUM_BITRATE) bitrate else BITRATE_GUESS
+    // FIXED_MTU mode pins HW_MTU to the configured value; default mode applies the
+    // bitrate→HW_MTU optimisation python runs per-interface at config load
+    // (Reticulum.interface_post_init → interface.optimise_mtu(), Reticulum.py:860;
+    // Interface.optimise_mtu, Interface.py:198-221). The 10 Mbps BITRATE_GUESS maps
+    // to 8192. Falls back to the class HW_MTU only for the lowest bitrate tier
+    // (optimise_mtu → None). AUTOCONFIGURE_MTU=True for TCP, so the gate always holds.
+    override val hwMtu: Int = fixedMtuBytes ?: (Interface.optimiseMtu(this.bitrate.toLong()) ?: HW_MTU)
+    override val autoconfigureMtu: Boolean = (fixedMtuBytes == null)
+    override val fixedMtu: Boolean = (fixedMtuBytes != null)
     override val supportsLinkMtuDiscovery: Boolean = true
 
     // Discovery support
@@ -98,13 +119,22 @@ class TCPClientInterface(
     }
 
     override val ifacSize: Int
-        get() = if (_ifacCredentials != null) 16 else 0
+        get() = if (_ifacCredentials != null) {
+            // python Reticulum.py:719-723: configured ifac_size (bits) >=
+            // IFAC_MIN_SIZE*8 (==8) divides by 8; else floors to DEFAULT_IFAC_SIZE.
+            ifacSizeBits?.takeIf { it >= 8 }?.div(8) ?: DEFAULT_IFAC_SIZE
+        } else 0
 
     override val ifacKey: ByteArray?
         get() = _ifacCredentials?.key
 
     override val ifacIdentity: Identity?
         get() = _ifacCredentials?.identity
+
+    // Exponential backoff for reconnection: 1s, 2s, 4s... up to 60s, give up after maxReconnectAttempts
+    private val backoff = ExponentialBackoff(
+        maxAttempts = maxReconnectAttempts ?: 10
+    )
 
     private enum class ReconnectState {
         IDLE,
@@ -115,16 +145,19 @@ class TCPClientInterface(
     private var socket: Socket? = null
     private val reconnectState = AtomicReference(ReconnectState.IDLE)
     private val neverConnected = AtomicBoolean(true)
-    private val writing = AtomicBoolean(false)
+
+    // Serializes concurrent writes to the socket. Was previously an
+    // AtomicBoolean check-then-set with a 10ms Thread.sleep busy-spin —
+    // that's both racy (two threads can pass the check before either sets
+    // the flag, interleaving frame bytes on the socket) and slow
+    // (concurrent writes pay 10ms minimum per turn). A ReentrantLock gives
+    // proper mutual exclusion AND wakes immediately when the prior write
+    // releases, removing the per-frame floor on concurrent send latency.
+    private val writeLock = java.util.concurrent.locks.ReentrantLock()
 
     // Debug counters
     private val framesSent = AtomicLong(0)
     private val framesReceived = AtomicLong(0)
-
-    // Exponential backoff for reconnection: 1s, 2s, 4s... up to 60s, give up after maxReconnectAttempts
-    private val backoff = ExponentialBackoff(
-        maxAttempts = maxReconnectAttempts ?: 10
-    )
 
     // Coroutine scope for I/O operations (battery-efficient on Android)
     private val ioScope: CoroutineScope = createScope(parentScope).also {
@@ -185,7 +218,9 @@ class TCPClientInterface(
         processIncoming(data)
     }
 
-    private val kissDeframer = KISS.createDeframer { _, data ->
+    // Cap decoded KISS frames at this interface's HW_MTU, matching python's
+    // `len(data_buffer) < self.HW_MTU` read-loop gate (TCPInterface.py:370).
+    private val kissDeframer = KISS.createDeframer(hwMtu) { _, data ->
         val frameNum = framesReceived.incrementAndGet()
         if (DEBUG) {
             val hexPreview = data.take(16).joinToString(" ") { "%02x".format(it) }
@@ -225,9 +260,9 @@ class TCPClientInterface(
             val inputStream = sock.getInputStream()
 
             socket = sock
-            online.set(true)
-            neverConnected.set(false)
+            setOnline(true)
             onConnectionPublishedForTest?.invoke()
+            neverConnected.set(false)
 
             // Request tunnel synthesis for this connection
             wantsTunnel = true
@@ -272,7 +307,7 @@ class TCPClientInterface(
         } catch (e: Exception) {
             if (initial) {
                 log("Initial connection failed: ${e.message}")
-                log("Will retry with exponential backoff (1s, 2s, 4s... up to 60s)")
+                log("Will retry connection in ${RECONNECT_WAIT_MS / 1000} seconds")
             }
             null
         }
@@ -287,7 +322,7 @@ class TCPClientInterface(
         var connection: EstablishedConnection? = null
         var reconnectWasPending = false
         try {
-            while (!online.get() && !detached.get()) {
+            while (!online.value && !detached.get()) {
                 val delayMs = backoff.nextDelay()
 
                 if (delayMs == null) {
@@ -320,10 +355,19 @@ class TCPClientInterface(
         } catch (e: CancellationException) {
             // Scope was cancelled, stop reconnecting
         } finally {
-            // Clear reconnect ownership before starting the replacement read
-            // loop. This ensures an immediately closed replacement socket can
-            // synchronously claim the next reconnect instead of being dropped.
+            // Python clears reconnect ownership before starting the replacement
+            // read loop. This ensures an immediately closed replacement socket
+            // can synchronously claim the next reconnect instead of being dropped.
             reconnectWasPending = releaseReconnectOwnership()
+        }
+
+        // Install the reader only after ownership is back to IDLE, so an
+        // immediately failing socket can synchronously claim the next
+        // reconnect instead of being dropped.
+        connection?.let { established ->
+            if (ioScope.isActive && online.value && !detached.get()) {
+                startReadLoop(established.socket, established.inputStream)
+            }
         }
 
         // A write failure can tear down a newly published socket before its
@@ -332,7 +376,7 @@ class TCPClientInterface(
         if (
             reconnectWasPending &&
             ioScope.isActive &&
-            !online.get() &&
+            !online.value &&
             !detached.get()
         ) {
             ioScope.launch { reconnect() }
@@ -384,7 +428,7 @@ class TCPClientInterface(
             val buffer = ByteArray(4096)
 
             try {
-                while (isActive && online.get() && !detached.get()) {
+                while (isActive && online.value && !detached.get()) {
                     if (sock.isClosed || !sock.isConnected || sock.isInputShutdown) {
                         break
                     }
@@ -409,7 +453,7 @@ class TCPClientInterface(
                             debugLog("  socket state: isConnected=${sock.isConnected}, isClosed=${sock.isClosed}")
                             debugLog("  socket state: isInputShutdown=${sock.isInputShutdown}, isOutputShutdown=${sock.isOutputShutdown}")
                         }
-                        online.set(false)
+                        setOnline(false)
                         break
                     }
                 }
@@ -430,7 +474,7 @@ class TCPClientInterface(
                     }
                 }
                 if (!detached.get()) {
-                    online.set(false)
+                    setOnline(false)
                 }
             }
 
@@ -443,7 +487,7 @@ class TCPClientInterface(
     }
 
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) {
+        if (!online.value || detached.get()) {
             throw IllegalStateException("Interface is not online")
         }
 
@@ -457,14 +501,15 @@ class TCPClientInterface(
             throw IOException("Socket not in valid state for write: $state")
         }
 
-        // Wait for any pending write to complete
-        while (writing.get()) {
-            Thread.sleep(10)
-        }
-
+        // lockInterruptibly() preserves the previous behaviour: the old
+        // Thread.sleep(10) busy-spin would throw InterruptedException
+        // when the writer thread was interrupted during shutdown. A plain
+        // lock() parks uninterruptibly, which would silently swallow the
+        // interrupt until the socket gets closed via teardown(). Keeping
+        // the interrupt path lets stop()-style teardowns drain promptly
+        // even when a write is contended.
+        writeLock.lockInterruptibly()
         try {
-            writing.set(true)
-
             val framedData = if (useKissFraming) {
                 KISS.frame(data)
             } else {
@@ -514,7 +559,7 @@ class TCPClientInterface(
             teardown()
             throw e
         } finally {
-            writing.set(false)
+            writeLock.unlock()
         }
     }
 
@@ -531,19 +576,17 @@ class TCPClientInterface(
     /**
      * Notify the interface that the network has changed.
      *
-     * This resets the reconnection backoff counter, allowing quick
-     * reconnection attempts on the new network. Call this when:
+     * This requests reconnection on the new network when the interface is
+     * offline and no reconnect owner is active. Call this when:
      * - WiFi <-> cellular handoff occurs
      * - Network becomes available after being offline
      *
-     * Per CONTEXT.md: "Network changes reset the backoff counter"
      */
     fun onNetworkChanged() {
-        log("Network changed - resetting reconnection backoff")
-        backoff.reset()
+        log("Network changed - requesting reconnection")
 
         // If currently offline and not detached, trigger reconnection
-        if (!online.get() && !detached.get() && reconnectState.get() == ReconnectState.IDLE) {
+        if (!online.value && !detached.get() && reconnectState.get() == ReconnectState.IDLE) {
             ioScope.launch {
                 reconnect()
             }
@@ -565,7 +608,7 @@ class TCPClientInterface(
             debugLog("  frames sent: ${framesSent.get()}, frames received: ${framesReceived.get()}")
             debugLog("  detached: ${detached.get()}")
         }
-        online.set(false)
+        setOnline(false)
         closeSocket()
 
         if (!detached.get()) {

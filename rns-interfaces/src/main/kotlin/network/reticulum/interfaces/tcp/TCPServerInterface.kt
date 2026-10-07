@@ -8,6 +8,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import network.reticulum.Reticulum
 import network.reticulum.interfaces.toRef
 import network.reticulum.transport.Transport
 import kotlinx.coroutines.withContext
@@ -41,11 +42,23 @@ class TCPServerInterface(
     // IFAC (Interface Access Code) parameters for network isolation
     override val ifacNetname: String? = null,
     override val ifacNetkey: String? = null,
+    // Configured bitrate in bps. A value below MINIMUM_BITRATE is ignored and
+    // the interface keeps its class BITRATE_GUESS (python Reticulum.py:765-768).
+    bitrate: Int? = null,
+    // Pinned link MTU in bytes. Non-null puts the interface in FIXED_MTU mode
+    // (AUTOCONFIGURE_MTU off), so the negotiated link MTU settles at this value
+    // (python TCPInterface FIXED_MTU; the bridge's fixed_mtu config knob).
+    internal val fixedMtuBytes: Int? = null,
+    // Configured IFAC size in BITS. Resolved to bytes via the python floor at
+    // Reticulum.py:719-723 (>= IFAC_MIN_SIZE*8 -> //8, else DEFAULT_IFAC_SIZE).
+    private val ifacSizeBits: Int? = null,
 ) : Interface(name) {
 
     companion object {
         const val BITRATE_GUESS = 10_000_000 // 10 Mbps
         const val HW_MTU = 262144
+        /** Default IFAC tag length in bytes for packet/IP media (python TCPInterface.py:454). */
+        const val DEFAULT_IFAC_SIZE = 16
     }
 
     // IFAC credentials - derived lazily from network name/passphrase
@@ -54,7 +67,12 @@ class TCPServerInterface(
     }
 
     override val ifacSize: Int
-        get() = if (_ifacCredentials != null) 16 else 0
+        get() = if (_ifacCredentials != null) {
+            // python Reticulum.py:719-723: a configured ifac_size (bits) >=
+            // IFAC_MIN_SIZE*8 (==8) divides by 8; otherwise it floors back to
+            // DEFAULT_IFAC_SIZE.
+            ifacSizeBits?.takeIf { it >= 8 }?.div(8) ?: DEFAULT_IFAC_SIZE
+        } else 0
 
     override val ifacKey: ByteArray?
         get() = _ifacCredentials?.key
@@ -62,8 +80,19 @@ class TCPServerInterface(
     override val ifacIdentity: Identity?
         get() = _ifacCredentials?.identity
 
-    override val bitrate: Int = BITRATE_GUESS
-    override val hwMtu: Int = HW_MTU
+    // python Reticulum.py:765-768 — a configured bitrate below MINIMUM_BITRATE
+    // is ignored; the interface keeps its class BITRATE_GUESS.
+    override val bitrate: Int =
+        if (bitrate != null && bitrate >= Reticulum.MINIMUM_BITRATE) bitrate else BITRATE_GUESS
+    // FIXED_MTU mode pins HW_MTU to the configured value; default mode applies the
+    // bitrate→HW_MTU optimisation python runs per-interface at config load
+    // (Reticulum.interface_post_init → interface.optimise_mtu(), Reticulum.py:860;
+    // Interface.optimise_mtu, Interface.py:198-221). The 10 Mbps BITRATE_GUESS maps
+    // to 8192. Falls back to the class HW_MTU only for the lowest bitrate tier
+    // (optimise_mtu → None). AUTOCONFIGURE_MTU=True for TCP, so the gate always holds.
+    override val hwMtu: Int = fixedMtuBytes ?: (Interface.optimiseMtu(this.bitrate.toLong()) ?: HW_MTU)
+    override val autoconfigureMtu: Boolean = (fixedMtuBytes == null)
+    override val fixedMtu: Boolean = (fixedMtuBytes != null)
     override val supportsLinkMtuDiscovery: Boolean = true
 
     // Discovery support
@@ -73,8 +102,21 @@ class TCPServerInterface(
         network.reticulum.discovery.DiscoveryConstants.REACHABLE_ON to bindAddress,
         network.reticulum.discovery.DiscoveryConstants.PORT to bindPort,
     )
-    // Server can receive/send via its spawned client interfaces
-    // processOutgoing broadcasts to all connected clients
+    // Python-exact semantics (RNS/Interfaces/TCPInterface.py): the
+    // parent TCPServerInterface sets `IN=True` (canReceive) and starts
+    // with `OUT=False`, but `Reticulum.interface_post_init` flips OUT
+    // to True at config load (Reticulum.py:770-771). It therefore
+    // participates in Transport.outbound iteration. Its own
+    // `process_outgoing` is a `pass` (TCPInterface.py:627-628); the
+    // spawned child interfaces are what actually write to the wire,
+    // each registered with Transport via `onClientConnected` so
+    // Transport.transmit addresses them directly.
+    //
+    // Setting canSend=false here would exclude the parent from
+    // Transport.interfaces iteration entirely, breaking any code that
+    // looks up an interface by hash (link_table resolution, announce
+    // path broadcast, etc.) — see #46 follow-up where the send-inert
+    // variant regressed multi-hop resource transfers.
     override val canReceive: Boolean = true
     override val canSend: Boolean = true
 
@@ -105,7 +147,7 @@ class TCPServerInterface(
             serverSocket = ServerSocket()
             serverSocket?.reuseAddress = true
             serverSocket?.bind(InetSocketAddress(bindAddress, bindPort))
-            online.set(true)
+            setOnline(true)
             log("Listening on $bindAddress:$bindPort")
 
             acceptJob = ioScope.launch {
@@ -118,7 +160,7 @@ class TCPServerInterface(
     }
 
     private suspend fun acceptLoop() {
-        while (online.get() && !detached.get()) {
+        while (online.value && !detached.get()) {
             try {
                 val server = serverSocket ?: break
                 // Blocking accept wrapped in IO dispatcher
@@ -141,24 +183,35 @@ class TCPServerInterface(
                     parentServer = this,
                     useKissFraming = useKissFraming
                 )
+                // Mirror Python TCPInterface.py:619 — spawned_interface.mode = self.mode.
+                // The spawned child inherits the parent's effective mode so that
+                // Transport sees the configured mode when a packet arrives (the
+                // `receiving_interface` for a client-sourced packet is the spawned
+                // child, not the parent server).
+                //
+                // Contract: snapshot-at-spawn, backfill-on-change. This line
+                // copies the parent's effective mode as a concrete value at
+                // spawn time; later mutation of the parent's `modeOverride`
+                // does NOT automatically propagate to already-spawned children
+                // (each child has its own `modeOverride` field). Callers that
+                // need runtime mode changes to affect existing children must
+                // iterate `spawnedInterfaces` and back-fill — the conformance
+                // bridge does this in `wire_set_interface_mode`.
+                clientInterface.modeOverride = this.modeOverride ?: this.mode
 
                 clients.add(clientInterface)
                 spawnedInterfaces?.add(clientInterface)
 
                 clientInterface.onPacketReceived = { data, iface ->
-                    // Forward received packets to our callback
+                    // Forward received packets to Transport via the parent's callback.
+                    // Do NOT fan out to other connected clients — matches Python's
+                    // TCPServerInterface.incoming_connection semantics where spawned
+                    // children's process_outgoing is a pass. Packets reach peers through
+                    // Transport's routing decisions (outbound(packet)), not via raw
+                    // rebroadcast at the TCP layer. See #46 for why the fan-out broke
+                    // path-layer invariants (cached-announce overwrite, PR leakage,
+                    // announce mode filtering bypass, double delivery races).
                     onPacketReceived?.invoke(data, iface)
-
-                    // Rebroadcast to all OTHER clients (not the sender)
-                    for (otherClient in clients) {
-                        if (otherClient !== iface && otherClient.online.get()) {
-                            try {
-                                otherClient.processOutgoing(data)
-                            } catch (e: Exception) {
-                                // Client will be cleaned up by its own error handling
-                            }
-                        }
-                    }
                 }
 
                 clientInterface.start()
@@ -192,18 +245,18 @@ class TCPServerInterface(
     }
 
     /**
-     * Send data to all connected clients.
+     * Parent-level outbound is a no-op — mirrors Python
+     * `TCPServerInterface.process_outgoing` (RNS/Interfaces/TCPInterface.py:627-628,
+     * which is `pass`). Each spawned child is its own Transport-registered
+     * interface (via `onClientConnected`), so Transport.transmit addresses
+     * the correct child directly. Fanning out here would duplicate every
+     * Transport broadcast: once via this parent, again via each child that
+     * Transport iterates independently — producing the path-layer invariant
+     * violations that #46 set out to fix (cached-announce overwrite, PR
+     * leakage, announce mode-filter bypass, double delivery races).
      */
     override fun processOutgoing(data: ByteArray) {
-        for (client in clients) {
-            try {
-                if (client.online.get()) {
-                    client.processOutgoing(data)
-                }
-            } catch (e: Exception) {
-                // Client will be cleaned up by its own error handling
-            }
-        }
+        // Intentionally empty.
     }
 
     /**
@@ -271,8 +324,14 @@ class TCPServerClientInterface internal constructor(
     override val ifacKey: ByteArray? get() = parentServer.ifacKey
     override val ifacIdentity: Identity? get() = parentServer.ifacIdentity
 
-    override val bitrate: Int = TCPServerInterface.BITRATE_GUESS
-    override val hwMtu: Int = TCPServerInterface.HW_MTU
+    // Spawned children inherit the parent server's MTU/bitrate posture so the
+    // RECEIVER side of a fixed-MTU link negotiates the same value as the parent
+    // (mirrors python TCPInterface.py:619 spawned_interface.mode = self.mode,
+    // extended to the MTU/bitrate posture the parent resolved from config).
+    override val bitrate: Int = parentServer.bitrate
+    override val hwMtu: Int = parentServer.hwMtu
+    override val autoconfigureMtu: Boolean = parentServer.autoconfigureMtu
+    override val fixedMtu: Boolean = parentServer.fixedMtu
     override val supportsLinkMtuDiscovery: Boolean = true
 
     private val writing = AtomicBoolean(false)
@@ -285,14 +344,16 @@ class TCPServerClientInterface internal constructor(
         processIncoming(data)
     }
 
-    private val kissDeframer = KISS.createDeframer { _, data ->
+    // Cap decoded KISS frames at this interface's HW_MTU, matching python's
+    // `len(data_buffer) < self.HW_MTU` read-loop gate (TCPInterface.py:370).
+    private val kissDeframer = KISS.createDeframer(hwMtu) { _, data ->
         processIncoming(data)
     }
 
     override fun start() {
         socket.tcpNoDelay = true
         socket.soTimeout = 0
-        online.set(true)
+        setOnline(true)
 
         readJob = ioScope.launch {
             readLoop()
@@ -303,7 +364,7 @@ class TCPServerClientInterface internal constructor(
         val buffer = ByteArray(4096)
 
         try {
-            while (online.get() && !detached.get()) {
+            while (online.value && !detached.get()) {
                 // Blocking read wrapped in IO dispatcher
                 val bytesRead = withContext(Dispatchers.IO) {
                     socket.getInputStream().read(buffer)
@@ -334,41 +395,49 @@ class TCPServerClientInterface internal constructor(
     }
 
     override fun processOutgoing(data: ByteArray) {
-        if (!online.get() || detached.get()) {
+        if (!online.value || detached.get()) {
             throw IllegalStateException("Interface is not online")
         }
 
-        while (writing.get()) {
-            Thread.sleep(10)
-        }
+        // Serialize all writes to this spawned-client socket. Pre-#46 the
+        // TCPServerInterface's raw fan-out delivered packets on a single
+        // reader thread, hiding concurrency here. Post-#46, Transport routes
+        // via spawned children and multiple reader coroutines (one per
+        // connected peer) can each trigger a `processOutgoing` on the same
+        // target child concurrently — the old check-then-set on `writing`
+        // was racy and interleaved socket writes, corrupting resource
+        // transfers (status=CORRUPT / 7). A monitor lock is the minimum
+        // viable fix and matches Python's effective serialization via the
+        // GIL around blocking socket writes.
+        synchronized(this) {
+            try {
+                writing.set(true)
 
-        try {
-            writing.set(true)
+                val framedData = if (useKissFraming) {
+                    KISS.frame(data)
+                } else {
+                    HDLC.frame(data)
+                }
 
-            val framedData = if (useKissFraming) {
-                KISS.frame(data)
-            } else {
-                HDLC.frame(data)
+                socket.getOutputStream().write(framedData)
+                socket.getOutputStream().flush()
+
+                log("Sent ${data.size} bytes (framed: ${framedData.size} bytes)")
+                txBytes.addAndGet(framedData.size.toLong())
+                parentInterface?.txBytes?.addAndGet(framedData.size.toLong())
+
+            } catch (e: IOException) {
+                detach()
+                throw e
+            } finally {
+                writing.set(false)
             }
-
-            socket.getOutputStream().write(framedData)
-            socket.getOutputStream().flush()
-
-            log("Sent ${data.size} bytes (framed: ${framedData.size} bytes)")
-            txBytes.addAndGet(framedData.size.toLong())
-            parentInterface?.txBytes?.addAndGet(framedData.size.toLong())
-
-        } catch (e: IOException) {
-            detach()
-            throw e
-        } finally {
-            writing.set(false)
         }
     }
 
     override fun detach() {
         if (detached.getAndSet(true)) return
-        online.set(false)
+        setOnline(false)
 
         // Cancel coroutines first
         readJob?.cancel()
