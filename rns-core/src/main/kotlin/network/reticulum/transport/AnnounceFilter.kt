@@ -29,6 +29,18 @@ object AnnounceFilter {
         sourceMode: InterfaceMode?,
         outgoingAnnouncesFromInternal: Boolean = true,
     ): Boolean {
+        // Gate 1 (Transport.py:1471): an outgoing interface with
+        // announces_from_internal=False blocks an announce whose next hop is
+        // INTERNAL. Python checks this BEFORE the outgoing-mode switch, so it
+        // fires for ANY outgoing mode (not just FULL/POINT_TO_POINT/GATEWAY).
+        // Local destinations are exempt. `sourceMode == INTERNAL` implies the
+        // next-hop interface exists (mode is non-null), so this does not fire
+        // for the "next hop doesn't exist" (null) case that the mode branches
+        // below block separately.
+        if (!isLocalDestination && sourceMode == InterfaceMode.INTERNAL && !outgoingAnnouncesFromInternal) {
+            return false
+        }
+
         return when (outgoingMode) {
             // AP mode: never broadcast announces
             InterfaceMode.ACCESS_POINT -> false
@@ -66,13 +78,7 @@ object AnnounceFilter {
             }
 
             // FULL, POINT_TO_POINT, GATEWAY: no mode-based restrictions
-            // Gate 1 (Transport.py:1471): an outgoing interface with
-            // announces_from_internal=False blocks an announce whose next
-            // hop is INTERNAL. Fires for any outgoing mode.
-            else -> {
-                if (!isLocalDestination && sourceMode == InterfaceMode.INTERNAL && !outgoingAnnouncesFromInternal) false
-                else true
-            }
+            else -> true
         }
     }
 

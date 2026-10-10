@@ -347,6 +347,39 @@ class AnnounceFilterTest {
                 outgoingAnnouncesFromInternal = false
             ) shouldBe true
         }
+
+        // Gate 1 fires for ANY outgoing mode (checked before the mode switch,
+        // Transport.py:1471). Verify it is not skipped for the three
+        // mode-specific branches.
+        @Test
+        fun `Gate 1 blocks for INTERNAL outgoing mode`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.INTERNAL,
+                isLocalDestination = false,
+                sourceMode = InterfaceMode.INTERNAL,
+                outgoingAnnouncesFromInternal = false
+            ) shouldBe false
+        }
+
+        @Test
+        fun `Gate 1 blocks for ROAMING outgoing mode`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.ROAMING,
+                isLocalDestination = false,
+                sourceMode = InterfaceMode.INTERNAL,
+                outgoingAnnouncesFromInternal = false
+            ) shouldBe false
+        }
+
+        @Test
+        fun `Gate 1 blocks for BOUNDARY outgoing mode`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.BOUNDARY,
+                isLocalDestination = false,
+                sourceMode = InterfaceMode.INTERNAL,
+                outgoingAnnouncesFromInternal = false
+            ) shouldBe false
+        }
     }
 
     @Nested
