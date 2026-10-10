@@ -178,6 +178,7 @@ private fun parseMode(name: String?): InterfaceMode = when (name?.uppercase()) {
     "ROAMING" -> InterfaceMode.ROAMING
     "BOUNDARY" -> InterfaceMode.BOUNDARY
     "GATEWAY" -> InterfaceMode.GATEWAY
+    "INTERNAL" -> InterfaceMode.INTERNAL
     else -> throw IllegalArgumentException("Unknown interface mode: $name")
 }
 
@@ -358,6 +359,31 @@ fun handleBehavioralCommand(command: String, p: JsonObject): JsonObject = when (
         Transport.deregisterInterface(ref)
         inst.interfaces[ifaceId]?.detach()
         result("detached" to boolVal(true))
+    }
+
+    "behavioral_read_interface_mode" -> {
+        val inst = inst(p)
+        val ifaceId = p.str("iface_id")
+        val iface = inst.interfaces[ifaceId]
+            ?: throw IllegalArgumentException("Unknown iface_id: $ifaceId")
+        // The interface's effective mode (modeOverride wins, mirroring
+        // InterfaceAdapter.mode). `mode` is reported as the RNS wire
+        // constant (rnsCode, Interface.py:45-51), NOT the enum name, so the
+        // conformance differential is against the documented byte a
+        // conformant peer reports. `announces_to_internal` is None by default
+        // (Interface.py:124) and is a no-op in the RNS 1.5 gate, but surfaced
+        // for parity. `discover_paths` is DISCOVER_PATHS_FOR membership
+        // (Interface.py:55): includes INTERNAL, excludes FULL/POINT_TO_POINT/
+        // BOUNDARY.
+        val effectiveMode = iface.modeOverride ?: iface.mode
+        result(
+            "iface_id" to strVal(ifaceId),
+            "interface_hash" to hexVal(iface.getHash()),
+            "mode" to intVal(effectiveMode.rnsCode),
+            "announces_from_internal" to boolVal(iface.announcesFromInternal),
+            "announces_to_internal" to (iface.announcesToInternal?.let { boolVal(it) } ?: JsonNull.INSTANCE),
+            "discover_paths" to boolVal(effectiveMode in Interface.DISCOVER_PATHS_FOR),
+        )
     }
 
     // ===== Table reads =====

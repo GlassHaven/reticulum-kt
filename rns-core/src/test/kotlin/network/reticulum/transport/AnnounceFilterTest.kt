@@ -227,6 +227,126 @@ class AnnounceFilterTest {
                 sourceMode = InterfaceMode.ROAMING
             ) shouldBe true
         }
+
+        // --- INTERNAL outgoing (RNS 1.3.6+): allow by default; block only
+        //     when the next hop has no mode (null) or is BOUNDARY
+        //     (Transport.py:1479-1490) ---
+
+        @Test
+        fun `INTERNAL allows local destinations`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.INTERNAL,
+                isLocalDestination = true,
+                sourceMode = InterfaceMode.BOUNDARY
+            ) shouldBe true
+        }
+
+        @Test
+        fun `INTERNAL blocks when source is BOUNDARY`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.INTERNAL,
+                isLocalDestination = false,
+                sourceMode = InterfaceMode.BOUNDARY
+            ) shouldBe false
+        }
+
+        @Test
+        fun `INTERNAL blocks with null source mode`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.INTERNAL,
+                isLocalDestination = false,
+                sourceMode = null
+            ) shouldBe false
+        }
+
+        @Test
+        fun `INTERNAL allows when source is FULL`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.INTERNAL,
+                isLocalDestination = false,
+                sourceMode = InterfaceMode.FULL
+            ) shouldBe true
+        }
+
+        @Test
+        fun `INTERNAL allows when source is ROAMING`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.INTERNAL,
+                isLocalDestination = false,
+                sourceMode = InterfaceMode.ROAMING
+            ) shouldBe true
+        }
+
+        @Test
+        fun `INTERNAL allows when source is GATEWAY`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.INTERNAL,
+                isLocalDestination = false,
+                sourceMode = InterfaceMode.GATEWAY
+            ) shouldBe true
+        }
+
+        @Test
+        fun `INTERNAL allows when source is ACCESS_POINT`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.INTERNAL,
+                isLocalDestination = false,
+                sourceMode = InterfaceMode.ACCESS_POINT
+            ) shouldBe true
+        }
+
+        @Test
+        fun `INTERNAL allows when source is INTERNAL`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.INTERNAL,
+                isLocalDestination = false,
+                sourceMode = InterfaceMode.INTERNAL
+            ) shouldBe true
+        }
+
+        // --- Gate 1 (Transport.py:1471): an outgoing interface with
+        //     announces_from_internal=False blocks an announce whose next
+        //     hop is INTERNAL. Fires for any outgoing mode. ---
+
+        @Test
+        fun `FULL with announcesFromInternal=false blocks INTERNAL next hop`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.FULL,
+                isLocalDestination = false,
+                sourceMode = InterfaceMode.INTERNAL,
+                outgoingAnnouncesFromInternal = false
+            ) shouldBe false
+        }
+
+        @Test
+        fun `FULL with announcesFromInternal=true allows INTERNAL next hop`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.FULL,
+                isLocalDestination = false,
+                sourceMode = InterfaceMode.INTERNAL,
+                outgoingAnnouncesFromInternal = true
+            ) shouldBe true
+        }
+
+        @Test
+        fun `Gate 1 does not fire for a local destination`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.FULL,
+                isLocalDestination = true,
+                sourceMode = InterfaceMode.INTERNAL,
+                outgoingAnnouncesFromInternal = false
+            ) shouldBe true
+        }
+
+        @Test
+        fun `Gate 1 does not fire when source is not INTERNAL`() {
+            AnnounceFilter.shouldForward(
+                outgoingMode = InterfaceMode.FULL,
+                isLocalDestination = false,
+                sourceMode = InterfaceMode.ROAMING,
+                outgoingAnnouncesFromInternal = false
+            ) shouldBe true
+        }
     }
 
     @Nested
@@ -266,6 +386,15 @@ class AnnounceFilterTest {
         @Test
         fun `GATEWAY returns 7 day expiry`() {
             AnnounceFilter.pathExpiryForMode(InterfaceMode.GATEWAY) shouldBe
+                TransportConstants.PATHFINDER_E
+        }
+
+        @Test
+        fun `INTERNAL returns 7 day expiry`() {
+            // INTERNAL is not a special case in pathExpiryForMode (python
+            // only special-cases AP=1day / ROAMING=6h), so it falls to the
+            // default week-long PATHFINDER_E. Pin that decision.
+            AnnounceFilter.pathExpiryForMode(InterfaceMode.INTERNAL) shouldBe
                 TransportConstants.PATHFINDER_E
         }
 

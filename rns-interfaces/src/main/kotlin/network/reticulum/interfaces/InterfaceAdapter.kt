@@ -21,6 +21,8 @@ class InterfaceAdapter private constructor(
     override val rxBytes: Long get() = iface.rxBytes.get()
     override val txBytes: Long get() = iface.txBytes.get()
     override val mode: InterfaceMode get() = iface.modeOverride ?: iface.mode
+    override val announcesFromInternal: Boolean get() = iface.announcesFromInternal
+    override val announcesToInternal: Boolean? get() = iface.announcesToInternal
     override val announceCap: Double get() = iface.announceCap
     override val hwMtu: Int get() = iface.hwMtu ?: RnsConstants.MTU
     override val supportsLinkMtuDiscovery: Boolean get() = iface.supportsLinkMtuDiscovery
