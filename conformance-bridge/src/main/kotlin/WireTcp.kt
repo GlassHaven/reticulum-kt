@@ -591,6 +591,7 @@ private fun parseInterfaceMode(raw: String?): InterfaceMode? {
         "roaming" -> InterfaceMode.ROAMING
         "boundary" -> InterfaceMode.BOUNDARY
         "gateway", "gw" -> InterfaceMode.GATEWAY
+        "internal" -> InterfaceMode.INTERNAL
         else -> throw IllegalArgumentException("Unknown interface mode: $raw")
     }
 }

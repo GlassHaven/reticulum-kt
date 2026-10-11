@@ -270,6 +270,7 @@ object Transport {
             InterfaceMode.ACCESS_POINT,
             InterfaceMode.GATEWAY,
             InterfaceMode.ROAMING,
+            InterfaceMode.INTERNAL,
         )
 
     // ===== Tables =====
@@ -3413,7 +3414,7 @@ object Transport {
                     // (Python Transport.py:1040-1084)
                     if (packet.packetType == PacketType.ANNOUNCE) {
                         val isLocal = destinations.any { it.hash.contentEquals(packet.destinationHash) }
-                        if (!AnnounceFilter.shouldForward(iface.mode, isLocal, null)) continue
+                        if (!AnnounceFilter.shouldForward(iface.mode, isLocal, null, iface.announcesFromInternal)) continue
                     }
 
                     if (transmit(iface, packedData)) sent = true
@@ -4121,7 +4122,7 @@ object Transport {
                 }
             }
 
-            if (AnnounceFilter.shouldForward(iface.mode, isLocal, sourceMode)) {
+            if (AnnounceFilter.shouldForward(iface.mode, isLocal, sourceMode, iface.announcesFromInternal)) {
                 queueAnnounce(
                     destinationHash = destinationHash,
                     raw = retransmitRaw,
@@ -6428,6 +6429,23 @@ interface InterfaceRef {
     /** Interface operational mode. */
     val mode: InterfaceMode
         get() = InterfaceMode.FULL
+
+    /**
+     * Whether this interface re-broadcasts an announce received on an
+     * INTERNAL next-hop (Python `announces_from_internal`, default True).
+     * When false, the outgoing interface blocks any announce whose next
+     * hop is INTERNAL (Gate 1 in Transport.py:1471).
+     */
+    val announcesFromInternal: Boolean
+        get() = true
+
+    /**
+     * Whether the next hop accepts announces from an INTERNAL egress
+     * interface (Python `announces_to_internal`, default None). In the
+     * RNS 1.5 gate this is a no-op; surfaced for parity.
+     */
+    val announcesToInternal: Boolean?
+        get() = null
 
     /** Bitrate in bits per second (0 if unknown). */
     val bitrate: Int

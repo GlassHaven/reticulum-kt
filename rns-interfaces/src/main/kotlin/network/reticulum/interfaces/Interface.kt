@@ -64,6 +64,23 @@ abstract class Interface(
     open val mode: InterfaceMode = InterfaceMode.FULL
 
     /**
+     * Whether this interface re-broadcasts an announce received on an
+     * INTERNAL next-hop (Python `announces_from_internal`, default True,
+     * Interface.py:123). When false, the outgoing interface blocks any
+     * announce whose next hop is INTERNAL (Gate 1 in Transport.py:1471).
+     */
+    open val announcesFromInternal: Boolean = true
+
+    /**
+     * Whether the next hop accepts announces from an INTERNAL egress
+     * interface (Python `announces_to_internal`, default None,
+     * Interface.py:124). In the RNS 1.5 gate this is a no-op (both
+     * True and not-True fall through to allow), but it is surfaced for
+     * parity and by `rnstatus`.
+     */
+    open var announcesToInternal: Boolean? = null
+
+    /**
      * Runtime override for [mode], settable after interface construction.
      *
      * When non-null, [InterfaceAdapter.mode] surfaces this value to Transport
@@ -254,7 +271,8 @@ abstract class Interface(
         val DISCOVER_PATHS_FOR = setOf(
             InterfaceMode.ACCESS_POINT,
             InterfaceMode.GATEWAY,
-            InterfaceMode.ROAMING
+            InterfaceMode.ROAMING,
+            InterfaceMode.INTERNAL
         )
 
         /**

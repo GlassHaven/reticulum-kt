@@ -186,12 +186,19 @@ enum class AesMode(val keySize: Int) {
 
 /**
  * Interface operational modes.
+ *
+ * Each value carries its RNS wire constant (`rnsCode`, RNS/Interfaces/
+ * Interface.py:45-51): the byte a conformant peer reports / uses on the
+ * wire for that mode. A conformance port must expose the same constant -
+ * `behavioral_read_interface_mode` returns `rnsCode` so the differential
+ * is against the documented byte, not an arbitrary enum ordinal.
  */
-enum class InterfaceMode {
-    FULL,           // Full access point with routing
-    POINT_TO_POINT, // Direct peer-to-peer
-    ACCESS_POINT,   // WiFi-like access point
-    ROAMING,        // Mobile roaming interface
-    BOUNDARY,       // Network boundary
-    GATEWAY         // Gateway between networks
+enum class InterfaceMode(val rnsCode: Int) {
+    FULL(0x01),           // Full access point with routing
+    POINT_TO_POINT(0x02), // Direct peer-to-peer
+    ACCESS_POINT(0x03),   // WiFi-like access point
+    ROAMING(0x04),        // Mobile roaming interface
+    BOUNDARY(0x05),       // Network boundary
+    GATEWAY(0x06),        // Gateway between networks
+    INTERNAL(0x07);       // Semi-transport mode: relays + path discovery, no public transit (RNS 1.3.6+)
 }
