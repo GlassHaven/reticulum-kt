@@ -150,6 +150,7 @@ fun main() {
         "boundary" -> InterfaceMode.BOUNDARY
         "gateway" -> InterfaceMode.GATEWAY
         "p2p", "point_to_point" -> InterfaceMode.POINT_TO_POINT
+        "internal" -> InterfaceMode.INTERNAL
         else -> InterfaceMode.FULL
     }
 
